@@ -1099,10 +1099,10 @@ class StemSeparate:
                     "BOOLEAN",
                     {"default": True, "tooltip": "half precision (CUDA only)"},
                 ),
-                # 临时开关：打开时把 6 轨分离 wav 保存到 output/stems/<时间戳>/
+                # 临时开关：打开时把 6 轨分离 flac 保存到 output/stems/<音频名>_<时间戳>/
                 "save_outputs": (
                     "BOOLEAN",
-                    {"default": False, "tooltip": "temporary: save stem wavs to output/stems/"},
+                    {"default": False, "tooltip": "temporary: save stem flacs to output/stems/"},
                 ),
             },
             "hidden": {
