@@ -1,0 +1,21 @@
+# ComfyUI-instrument-agnostic-amt 节点依赖
+# 安装到 ComfyUI 使用的 Python 环境（例如 portable 版: python_embeded/python.exe -m pip install -r requirements.txt）
+#
+# 注意：
+# - torch / torchaudio / numpy / scipy / PyYAML / tqdm / einops 等由 ComfyUI 自带
+#   （对照 update/current_requirements.txt），此处不重复列出
+# - 模型权重无需安装：首次执行节点时自动下载到 ComfyUI/models/instrument_agnostic_amt/
+
+# --- AMT 核心推理 ---
+pretty_midi
+mido
+mir_eval
+soundfile
+miditoolkit
+
+# --- beat/chord/key 模型 ---
+dlchordx
+torch_optimizer
+
+# --- stem 分离（Stem Separate 节点）---
+stem-splitter
