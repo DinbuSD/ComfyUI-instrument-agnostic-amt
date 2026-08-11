@@ -905,6 +905,11 @@ class BeatChordKey:
                     {"default": "auto",
                      "tooltip": "auto: pick automatically, fall back to CPU if CUDA unavailable"},
                 ),
+                "fix_leading_tempo": (
+                    "BOOLEAN",
+                    {"default": True,
+                     "tooltip": "fix the inflated leading tempo the official model writes when the song starts with silence/pickup"},
+                ),
             },
             "hidden": {
                 # 节点 id：用于在节点上显示进度条
@@ -918,7 +923,8 @@ class BeatChordKey:
     FUNCTION = "infer"
     CATEGORY = "Audio/AMT"
 
-    def infer(self, midi, checkpoint="", device="auto", prompt=None, unique_id=None):
+    def infer(self, midi, checkpoint="", device="auto", fix_leading_tempo=True,
+              prompt=None, unique_id=None):
         _import_amt()
         from instrument_agnostic_amt.beat_chord.cli.infer import (
             predict_beat_chord_for_midi,
@@ -967,6 +973,18 @@ class BeatChordKey:
                 print("[AMT] Beat/chord/key produced no output; returning input MIDI unchanged")
                 return (midi,)
             result = pretty_midi.PrettyMIDI(str(out_path))
+            # 官方对开头空白段外推虚高的初始 tempo（t=0 处可能是正常值的数倍）。
+            # 补丁：首 tempo 超过第二个 1.5 倍时，用第二个替换（默认开，可关）。
+            # pretty_midi 无 tempo setter，直接改内部 _tick_scales（tempo = 60/(scale*resolution)）
+            if fix_leading_tempo:
+                _times, _bpms = result.get_tempo_changes()
+                if len(_bpms) >= 2 and _bpms[0] > _bpms[1] * 1.5:
+                    _tick, _ = result._tick_scales[0]
+                    result._tick_scales[0] = (
+                        _tick,
+                        60.0 / (_bpms[1] * result.resolution),
+                    )
+                    print(f"[AMT] Leading tempo fixed: {_bpms[0]:.1f} -> {_bpms[1]:.1f} BPM")
             n_tracks = len(result.instruments)
             n_notes = sum(len(i.notes) for i in result.instruments)
             print(f"[AMT] Beat/chord/key done: {n_tracks} tracks, {n_notes} notes")
