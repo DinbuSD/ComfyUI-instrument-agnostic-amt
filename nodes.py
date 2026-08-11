@@ -946,6 +946,11 @@ class BeatChordKey:
 
         try:
             midi.write(str(midi_path))
+            # 官方 _load_midi_events 按文件路径 lru_cache：temp 文件名固定，
+            # 同进程连着跑多首时第二次会命中第一首的缓存（BPM/调性错乱）。
+            import instrument_agnostic_amt.beat_chord.midi_roll as _mr
+
+            _mr._load_midi_events.cache_clear()
             print(f"[AMT] Predicting beat/chord/key (device={dev.type})")
             predict_beat_chord_for_midi(
                 midi_path,
