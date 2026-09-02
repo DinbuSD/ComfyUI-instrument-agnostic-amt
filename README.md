@@ -16,7 +16,8 @@
 
 | 节点 | 输入 → 输出 | 说明 |
 |---|---|---|
-| **Instrument Agnostic Amt** | AUDIO → MIDI / note_count / duration | 音频转 MIDI；model 下拉选模型（缺失自动下载） |
+| **Instrument Agnostic Amt** | AUDIO → MIDI / note_count / duration | 音频转 MIDI（精简参数：model + 静音检测 + 精度 + 设备）；model 缺失自动下载 |
+| **Instrument Agnostic Amt Advanced** | AUDIO → MIDI / note_count / duration | 同上，另暴露全部高级参数（window/stride/merge/镲合并） |
 | **Stem Separate** | AUDIO → 6×AUDIO | 音轨分离；`save_outputs` 开关可保存分离产物到 output/stems/ |
 | **Merge MIDI** | MIDI×8 → MIDI | 多轨 MIDI 合并（乐器按 program/名称归并） |
 | **Predict Velocity** | MIDI + AUDIO → MIDI | 从分离音频预测音符力度（stem_name 下拉） |
@@ -98,6 +99,8 @@ LoadAudio
 | stem_splitter.pt | 音轨分离（BS-RoFormer） | 350 MB |
 
 > 2026-09 上游（tsumugi）起，分轨工作流对 vocals / drums / other 改用 `*_v1_5` 新模型（`vocal_harmony_v1_5` / `drums_v1_5` / `other_v1_5`）；旧模型保留可选。`*_v1_5` 缺失时执行中自动下载。
+
+> **转写节点新增参数**：`collapse_crash_cymbals`（默认开）——把鼓的 Crash Cymbal 2（pitch 57）合并到 Crash Cymbal 1（pitch 49），对齐上游 2026-09 起的默认行为；关掉则保留两个镲独立输出。
 
 ## 已知限制
 

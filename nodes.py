@@ -50,6 +50,10 @@ _MODEL_CATALOG = [
 
 _MISSING_HINT = "(No checkpoint found. Place .pth files in ComfyUI/models/instrument_agnostic_amt/)"
 
+# 上游 2026-09（tsumugi）默认鼓音高别名：collapse_crash_cymbals 开时传给
+# build_midi 的 drum_pitch_aliases（与官方 infer.py 的 DEFAULT_DRUM_PITCH_ALIASES 一致）
+_DEFAULT_DRUM_PITCH_ALIASES = {40: 38, 57: 49}
+
 _AMT = {}          # lazy import cache
 
 # 模型缓存：LRU 限制条目数，避免多模型工作流把显存占满
@@ -275,79 +279,100 @@ def _patch_tqdm_progress(module, node_id):
     return restore
 
 
-class InstrumentAgnosticAmt:
-    """Audio -> MIDI transcription. Connect LoadAudio's AUDIO output;
-    the MIDI result is written by the Save MIDI node."""
+class _AmtTranscribeBase:
+    """Shared transcription logic for the basic and advanced nodes.
 
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                # AUDIO-typed inputs render as a pure port on the left side
-                "audio": ("AUDIO",),
-                # Checkpoint dropdown; rescanned when the UI refreshes
-                "model": (_list_checkpoints(),),
-            },
-            "optional": {
-                # 静音检测：RMS 低于阈值视为无音频，跳过转写（省时间）
-                "skip_silent": (
-                    "BOOLEAN",
-                    {"default": True,
-                     "tooltip": "skip transcription when the track RMS is below the threshold"},
-                ),
-                "silence_rms_threshold": (
-                    "FLOAT",
-                    {"default": 0.001, "min": 0.0, "max": 1.0, "step": 0.0001,
-                     "tooltip": "RMS below this = silent track (separated empty stems ~0.00003, real stems ~0.1)"},
-                ),
-                "use_amp": (
-                    "BOOLEAN",
-                    {"default": True, "tooltip": "mixed precision (CUDA only)"},
-                ),
-                # auto: use CUDA when available, otherwise CPU; or force one
-                "device": (
-                    ["auto", "cuda", "cpu"],
-                    {"default": "auto",
-                     "tooltip": "auto: pick automatically, fall back to CPU if CUDA unavailable"},
-                ),
-                # --- 高级参数 ---
-                "window_ms": (
-                    "INT",
-                    {"default": -1, "min": -1, "max": 60000, "step": 500,
-                     "tooltip": "-1 = use model default window (ms)"},
-                ),
-                "stride_ms": (
-                    "INT",
-                    {"default": -1, "min": -1, "max": 60000, "step": 500,
-                     "tooltip": "-1 = half of window (ms)"},
-                ),
-                "window_batch_size": (
-                    "INT",
-                    {"default": 1, "min": 1, "max": 16,
-                     "tooltip": "windows processed at once (higher = faster but more VRAM)"},
-                ),
-                "merge_gap_ms": (
-                    "INT",
-                    {"default": -1, "min": -1, "max": 500,
-                     "tooltip": "-1 = default; merge threshold for small note gaps"},
-                ),
-                "merge_onset_ms": (
-                    "INT",
-                    {"default": 20, "min": 0, "max": 500,
-                     "tooltip": "merge threshold for near-simultaneous onsets"},
-                ),
-            },
-            "hidden": {
-                # 节点 id：用于在节点上显示解码进度条
-                "prompt": "PROMPT",
-                "unique_id": "UNIQUE_ID",
-            },
-        }
+    Subclasses only override INPUT_TYPES (which params the UI shows) and
+    INPUT_IS_LIST-style wiring; the execute method accepts every parameter
+    with defaults so a basic node simply omits the advanced ones.
+    """
 
     RETURN_TYPES = ("AMT_MIDI", "INT", "FLOAT")
     RETURN_NAMES = ("midi", "note_count", "audio_duration_s")
     FUNCTION = "transcribe"
     CATEGORY = "Audio/AMT"
+
+    # Basic params (shown on the basic node)
+    _BASIC_OPTIONAL = {
+        # 静音检测：RMS 低于阈值视为无音频，跳过转写（省时间）
+        "skip_silent": (
+            "BOOLEAN",
+            {"default": True,
+             "tooltip": "skip transcription when the track RMS is below the threshold"},
+        ),
+        "silence_rms_threshold": (
+            "FLOAT",
+            {"default": 0.001, "min": 0.0, "max": 1.0, "step": 0.0001,
+             "tooltip": "RMS below this = silent track (separated empty stems ~0.00003, real stems ~0.1)"},
+        ),
+        "use_amp": (
+            "BOOLEAN",
+            {"default": True, "tooltip": "mixed precision (CUDA only)"},
+        ),
+        # auto: use CUDA when available, otherwise CPU; or force one
+        "device": (
+            ["auto", "cuda", "cpu"],
+            {"default": "auto",
+             "tooltip": "auto: pick automatically, fall back to CPU if CUDA unavailable"},
+        ),
+    }
+
+    # Advanced params (only on the Advanced node)
+    _ADVANCED_OPTIONAL = {
+        # --- 高级参数 ---
+        "window_ms": (
+            "INT",
+            {"default": -1, "min": -1, "max": 60000, "step": 500,
+             "tooltip": "-1 = use model default window (ms)"},
+        ),
+        "stride_ms": (
+            "INT",
+            {"default": -1, "min": -1, "max": 60000, "step": 500,
+             "tooltip": "-1 = half of window (ms)"},
+        ),
+        "window_batch_size": (
+            "INT",
+            {"default": 1, "min": 1, "max": 16,
+             "tooltip": "windows processed at once (higher = faster but more VRAM)"},
+        ),
+        "merge_gap_ms": (
+            "INT",
+            {"default": -1, "min": -1, "max": 500,
+             "tooltip": "-1 = default; merge threshold for small note gaps"},
+        ),
+        "merge_onset_ms": (
+            "INT",
+            {"default": 20, "min": 0, "max": 500,
+             "tooltip": "merge threshold for near-simultaneous onsets"},
+        ),
+        # 上游 2026-09（tsumugi）默认行为：Crash Cymbal 2 (57) 合并到 Crash 1 (49)
+        "collapse_crash_cymbals": (
+            "BOOLEAN",
+            {"default": True,
+             "tooltip": "map drum pitch 57 (Crash 2) onto 49 (Crash 1) in the MIDI"},
+        ),
+    }
+
+
+class InstrumentAgnosticAmtAdvanced(_AmtTranscribeBase):
+    """Audio -> MIDI transcription with every tunable exposed."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "model": (_list_checkpoints(),),
+            },
+            "optional": {
+                **cls._BASIC_OPTIONAL,
+                **cls._ADVANCED_OPTIONAL,
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "unique_id": "UNIQUE_ID",
+            },
+        }
 
     def transcribe(
         self,
@@ -358,6 +383,7 @@ class InstrumentAgnosticAmt:
         window_batch_size=1,
         merge_gap_ms=-1,
         merge_onset_ms=20,
+        collapse_crash_cymbals=True,
         use_amp=True,
         device="auto",
         skip_silent=True,
@@ -553,6 +579,11 @@ class InstrumentAgnosticAmt:
             min_midi_note_ms=5.0,
             max_midi_melodic_instruments=15,
             instrument_volumes=None,
+            # 上游 2026-09（tsumugi）：collapse_crash_cymbals 开时把鼓的
+            # Crash 2 (57) 合并到 Crash 1 (49)（官方默认行为）
+            drum_pitch_aliases=(
+                _DEFAULT_DRUM_PITCH_ALIASES if collapse_crash_cymbals else None
+            ),
             return_stats=True,
         )
 
@@ -563,6 +594,29 @@ class InstrumentAgnosticAmt:
             f"skipped_silent={stats.get('skipped_silent_window_count')})"
         )
         return (midi, len(notes), float(duration))
+
+
+class InstrumentAgnosticAmt(InstrumentAgnosticAmtAdvanced):
+    """Audio -> MIDI transcription (basic params). Connect LoadAudio's AUDIO
+    output; the MIDI result is written by the Save MIDI node.
+    Advanced parameters live on Instrument Agnostic Amt Advanced."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                # AUDIO-typed inputs render as a pure port on the left side
+                "audio": ("AUDIO",),
+                # Checkpoint dropdown; rescanned when the UI refreshes
+                "model": (_list_checkpoints(),),
+            },
+            "optional": dict(cls._BASIC_OPTIONAL),
+            "hidden": {
+                # 节点 id：用于在节点上显示解码进度条
+                "prompt": "PROMPT",
+                "unique_id": "UNIQUE_ID",
+            },
+        }
 
 
 def _merge_midi_objects(midi_objects: list, max_melodic_instruments: int = 15):
@@ -1342,6 +1396,7 @@ class SaveAmtMidi:
 
 NODE_CLASS_MAPPINGS = {
     "InstrumentAgnosticAmt": InstrumentAgnosticAmt,
+    "InstrumentAgnosticAmtAdvanced": InstrumentAgnosticAmtAdvanced,
     "StemSeparate": StemSeparate,
     "MergeMidi": MergeMidi,
     "VelocityPredict": VelocityPredict,
@@ -1351,6 +1406,7 @@ NODE_CLASS_MAPPINGS = {
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "InstrumentAgnosticAmt": "Instrument Agnostic Amt",
+    "InstrumentAgnosticAmtAdvanced": "Instrument Agnostic Amt Advanced",
     "StemSeparate": "Stem Separate",
     "MergeMidi": "Merge MIDI",
     "VelocityPredict": "Predict Velocity",

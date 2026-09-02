@@ -16,7 +16,8 @@ A ComfyUI node pack for transcribing arbitrary instrument audio (piano, guitar, 
 
 | Node | Input → Output | Description |
 |---|---|---|
-| **Instrument Agnostic Amt** | AUDIO → MIDI / note_count / duration | Audio to MIDI transcription; pick a model from the dropdown (auto-downloads when missing) |
+| **Instrument Agnostic Amt** | AUDIO → MIDI / note_count / duration | Audio to MIDI transcription (basic params: model + silence + precision + device); missing models auto-download |
+| **Instrument Agnostic Amt Advanced** | AUDIO → MIDI / note_count / duration | Same, but exposes all advanced params (window/stride/merge/cymbal collapse) |
 | **Stem Separate** | AUDIO → 6×AUDIO | Stem separation; the `save_outputs` toggle saves separated stems to output/stems/ |
 | **Merge MIDI** | MIDI×8 → MIDI | Merge multi-track MIDI (instruments grouped by program/name) |
 | **Predict Velocity** | MIDI + AUDIO → MIDI | Predict note velocities from the separated audio (stem_name dropdown) |
@@ -98,6 +99,8 @@ Optional post-processing: `Predict Velocity` per track (requires that track's au
 | stem_splitter.pt | Stem separation (BS-RoFormer) | 350 MB |
 
 > Since the 2026-09 upstream rename (tsumugi), the per-stem workflow uses the new `*_v1_5` models for vocals / drums / other (`vocal_harmony_v1_5` / `drums_v1_5` / `other_v1_5`); the older models remain selectable. Any missing `*_v1_5` file is auto-downloaded on first use.
+
+> **New transcription node option**: `collapse_crash_cymbals` (default on) maps drum pitch 57 (Crash Cymbal 2) onto 49 (Crash Cymbal 1), matching the upstream default since 2026-09; turn it off to keep both cymbals separate.
 
 ## Known Limitations
 
