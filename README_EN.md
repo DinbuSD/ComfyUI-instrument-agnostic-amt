@@ -117,4 +117,4 @@ The node code is MIT licensed. The vendored `instrument_agnostic_amt/` directory
 
 ## Development Note
 
-This node pack was developed with DeepSeek models (DeepSeek Harness frontend).
+This node pack was developed with DeepSeek-V4-Flash (model) and the DeepSeek Harness (frontend).
