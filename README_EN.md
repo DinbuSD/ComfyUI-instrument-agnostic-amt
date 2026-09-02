@@ -2,7 +2,7 @@
 
 [中文](README.md) | English
 
-A ComfyUI node pack for transcribing arbitrary instrument audio (piano, guitar, bass, vocals, strings, synthesizers, etc.) into MIDI, based on [instrument-agnostic-amt](https://github.com/anime-song/instrument-agnostic-amt) (Neural Semi-CRF architecture, MIT licensed, source vendored inside this node pack).
+A ComfyUI node pack for transcribing arbitrary instrument audio (piano, guitar, bass, vocals, strings, synthesizers, etc.) into MIDI, based on [instrument-agnostic-amt](https://github.com/anime-song/instrument-agnostic-amt) (Neural Semi-CRF architecture, MIT licensed, source vendored inside this node pack). The upstream project was renamed **tsumugi** in 2026-09 (the Python package name `instrument_agnostic_amt` is unchanged).
 
 ## Features
 
@@ -68,12 +68,12 @@ LoadAudio(audio) → Instrument Agnostic Amt(model=default) → Save MIDI
 ```
 LoadAudio
   → Stem Separate
-      ├─ vocals → Amt(vocal_harmony)─┐
-      ├─ guitar → Amt(guitar_v1_5)  ─┤
-      ├─ bass   → Amt(bass_v2)      ─┼→ Merge MIDI → Beat Chord Key → Save MIDI
-      ├─ drums  → Amt(drums)        ─┤
-      ├─ piano  → Amt(default)      ─┤
-      └─ other  → Amt(other)        ─┘
+      ├─ vocals → Amt(vocal_harmony_v1_5)─┐
+      ├─ guitar → Amt(guitar_v1_5)       ─┤
+      ├─ bass   → Amt(bass_v2)           ─┼→ Merge MIDI → Beat Chord Key → Save MIDI
+      ├─ drums  → Amt(drums_v1_5)        ─┤
+      ├─ piano  → Amt(default)           ─┤
+      └─ other  → Amt(other_v1_5)        ─┘
 ```
 
 Optional post-processing: `Predict Velocity` per track (requires that track's audio); the "other" track is recommended to go through `Refine Instrument` (the stem most prone to misclassification); `Merge MIDI` accepts up to 8 inputs.
@@ -87,12 +87,17 @@ Optional post-processing: `Predict Velocity` per track (requires that track's au
 | best_model_vocal.pth | Vocals | 53.5 MB |
 | best_model_guitar_v1_5.pth | Guitar v1.5 | 54.5 MB |
 | best_model_vocal_harmony.pth | Vocal harmony | 54.5 MB |
+| best_model_vocal_harmony_v1_5.pth | Vocal harmony v1.5 (recommended for stems) | 54.5 MB |
 | best_model_drums.pth | Drums (experimental) | 54.5 MB |
+| best_model_drums_v1_5.pth | Drums v1.5 (recommended for stems) | 54.5 MB |
 | best_model_other.pth | Other instruments | 54.5 MB |
+| best_model_other_v1_5.pth | Other instruments v1.5 (recommended for stems) | 54.5 MB |
 | best_velocity_model.pth | Velocity prediction | 55.0 MB |
 | best_instrument_refinement.pth | Instrument refinement | 56.2 MB |
 | best_beat_chord_key.pth | Beat/chord/key | 86.9 MB |
 | stem_splitter.pt | Stem separation (BS-RoFormer) | 350 MB |
+
+> Since the 2026-09 upstream rename (tsumugi), the per-stem workflow uses the new `*_v1_5` models for vocals / drums / other (`vocal_harmony_v1_5` / `drums_v1_5` / `other_v1_5`); the older models remain selectable. Any missing `*_v1_5` file is auto-downloaded on first use.
 
 ## Known Limitations
 
@@ -103,7 +108,7 @@ Optional post-processing: `Predict Velocity` per track (requires that track's au
 
 ## License
 
-The node code is MIT licensed. The vendored `instrument_agnostic_amt/` directory is from [anime-song/instrument-agnostic-amt](https://github.com/anime-song/instrument-agnostic-amt) (MIT License, Copyright (c) 2026 [anime-song](https://github.com/anime-song); see `instrument_agnostic_amt/VENDORED_README.txt` for the vendoring notes). Model weights and the stem splitter weights belong to their original author (anime-song).
+The node code is MIT licensed. The vendored `instrument_agnostic_amt/` directory is from [anime-song/instrument-agnostic-amt](https://github.com/anime-song/instrument-agnostic-amt) (renamed [tsumugi](https://github.com/anime-song/tsumugi) since 2026-09; MIT License, Copyright (c) 2026 [anime-song](https://github.com/anime-song); see `instrument_agnostic_amt/VENDORED_README.txt` for the vendoring notes). Model weights and the stem splitter weights belong to their original author (anime-song).
 
 ## Development Note
 

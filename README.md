@@ -2,7 +2,7 @@
 
 中文 | [English](README_EN.md)
 
-将任意乐器音频（钢琴、吉他、贝斯、人声、弦乐、合成器等）转录为 MIDI 的 ComfyUI 节点集，基于 [instrument-agnostic-amt](https://github.com/anime-song/instrument-agnostic-amt)（Neural Semi-CRF 架构，MIT 许可，源码已 vendor 在本节点内）。
+将任意乐器音频（钢琴、吉他、贝斯、人声、弦乐、合成器等）转录为 MIDI 的 ComfyUI 节点集，基于 [instrument-agnostic-amt](https://github.com/anime-song/instrument-agnostic-amt)（Neural Semi-CRF 架构，MIT 许可，源码已 vendor 在本节点内）。上游项目已于 2026-09 更名为 **tsumugi**（代码包名 `instrument_agnostic_amt` 不变）。
 
 ## 功能
 
@@ -68,12 +68,12 @@ LoadAudio(音频) → Instrument Agnostic Amt(model=default) → Save MIDI
 ```
 LoadAudio
   → Stem Separate
-      ├─ vocals → Amt(vocal_harmony)─┐
-      ├─ guitar → Amt(guitar_v1_5)  ─┤
-      ├─ bass   → Amt(bass_v2)      ─┼→ Merge MIDI → Beat Chord Key → Save MIDI
-      ├─ drums  → Amt(drums)        ─┤
-      ├─ piano  → Amt(default)      ─┤
-      └─ other  → Amt(other)        ─┘
+      ├─ vocals → Amt(vocal_harmony_v1_5)─┐
+      ├─ guitar → Amt(guitar_v1_5)       ─┤
+      ├─ bass   → Amt(bass_v2)           ─┼→ Merge MIDI → Beat Chord Key → Save MIDI
+      ├─ drums  → Amt(drums_v1_5)        ─┤
+      ├─ piano  → Amt(default)           ─┤
+      └─ other  → Amt(other_v1_5)        ─┘
 ```
 
 可选后处理：每轨 `Predict Velocity`（需要该轨音频）；other 轨建议接 `Refine Instrument`（分类最易乱的轨道）；`Merge MIDI` 最多 8 路输入。
@@ -87,12 +87,17 @@ LoadAudio
 | best_model_vocal.pth | 人声 | 53.5 MB |
 | best_model_guitar_v1_5.pth | 吉他 v1.5 | 54.5 MB |
 | best_model_vocal_harmony.pth | 人声和声 | 54.5 MB |
+| best_model_vocal_harmony_v1_5.pth | 人声和声 v1.5（分轨推荐） | 54.5 MB |
 | best_model_drums.pth | 鼓（实验性） | 54.5 MB |
+| best_model_drums_v1_5.pth | 鼓 v1.5（分轨推荐） | 54.5 MB |
 | best_model_other.pth | 其他乐器 | 54.5 MB |
+| best_model_other_v1_5.pth | 其他乐器 v1.5（分轨推荐） | 54.5 MB |
 | best_velocity_model.pth | 力度预测 | 55.0 MB |
 | best_instrument_refinement.pth | 乐器精修 | 56.2 MB |
 | best_beat_chord_key.pth | 节拍/和弦/调性 | 86.9 MB |
 | stem_splitter.pt | 音轨分离（BS-RoFormer） | 350 MB |
+
+> 2026-09 上游（tsumugi）起，分轨工作流对 vocals / drums / other 改用 `*_v1_5` 新模型（`vocal_harmony_v1_5` / `drums_v1_5` / `other_v1_5`）；旧模型保留可选。`*_v1_5` 缺失时执行中自动下载。
 
 ## 已知限制
 
@@ -103,7 +108,7 @@ LoadAudio
 
 ## 许可
 
-节点代码为 MIT 许可。vendor 的 `instrument_agnostic_amt/` 目录来自 [anime-song/instrument-agnostic-amt](https://github.com/anime-song/instrument-agnostic-amt)（MIT 许可，Copyright (c) 2026 [anime-song](https://github.com/anime-song)，vendor 说明见 `instrument_agnostic_amt/VENDORED_README.txt`）。模型权重与分离器权重版权归原作者（anime-song）。
+节点代码为 MIT 许可。vendor 的 `instrument_agnostic_amt/` 目录来自 [anime-song/instrument-agnostic-amt](https://github.com/anime-song/instrument-agnostic-amt)（2026-09 起更名 [tsumugi](https://github.com/anime-song/tsumugi)，MIT 许可，Copyright (c) 2026 [anime-song](https://github.com/anime-song)，vendor 说明见 `instrument_agnostic_amt/VENDORED_README.txt`）。模型权重与分离器权重版权归原作者（anime-song）。
 
 ## 开发声明
 

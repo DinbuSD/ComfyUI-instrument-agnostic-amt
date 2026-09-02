@@ -30,15 +30,19 @@ except Exception:
     _CHECKPOINT_DIRS = [NODE_DIR.parent.parent / "models" / "instrument_agnostic_amt"]
 
 # 完整模型目录（下拉框显示全部；缺失时执行中自动下载）
-# 转写模型（主节点）7 个，bass/guitar 的 v1 版已弃用不列入
+# 转写模型（主节点）10 个：上游 2026-09 重构（tsumugi）后 drums/other/vocal_harmony
+# 分轨走 *_v1_5 新模型（旧版保留，下拉仍可选）
 _MODEL_CATALOG = [
     "best_model.pth",
     "best_model_bass_v2.pth",
     "best_model_vocal.pth",
     "best_model_guitar_v1_5.pth",
     "best_model_vocal_harmony.pth",
+    "best_model_vocal_harmony_v1_5.pth",
     "best_model_drums.pth",
+    "best_model_drums_v1_5.pth",
     "best_model_other.pth",
+    "best_model_other_v1_5.pth",
     "best_velocity_model.pth",
     "best_instrument_refinement.pth",
     "best_beat_chord_key.pth",
@@ -408,6 +412,9 @@ class InstrumentAgnosticAmt:
             instrument_pair_infer_topk=256,
             instrument_pair_gate_threshold=-3.0,
             instrument_pair_max_pairs=512,
+            # 上游 2026-09 重构（tsumugi）新增：dense Semi-CRF 解码后端
+            # （torch 即可；triton 需 CUDA JIT 编译，本节点不启用）
+            semi_crf_backend="torch",
         )
         settings = amt["resolve_inference_settings"](config, training_args, args)
         settings = replace(
