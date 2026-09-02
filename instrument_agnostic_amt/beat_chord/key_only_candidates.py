@@ -14,6 +14,14 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import torch
 
+from ..runtime import (
+    empty_device_cache,
+    is_amp_supported,
+    maybe_compile_forward,
+    resolve_amp_dtype,
+    resolve_device,
+)
+
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_INPUT_DIR = Path("beat_chord_dataset/source_audio")
@@ -275,7 +283,7 @@ def resolve_stem_model_type(stem_name: str) -> str:
     if "guitar" in normalized:
         return "guitar_v1_5"
     if "other" in normalized:
-        return "other"
+        return "other_v1_5"
     return "default"
 
 
@@ -387,8 +395,13 @@ class StemTranscriptionRunner:
         strict_velocity: bool,
         force: bool,
         cleanup_stems: bool,
+        amp: bool = False,
+        amp_dtype: str | None = None,
+        compile_model: bool = False,
+        compile_velocity: bool = False,
+        compile_mode: str = "default",
     ) -> None:
-        self.device = torch.device(device)
+        self.device = resolve_device(device)
         self.amt_checkpoint_dir = Path(amt_checkpoint_dir).resolve()
         self.separation_checkpoint = Path(separation_checkpoint).resolve()
         self.velocity_checkpoint = Path(velocity_checkpoint).resolve()
@@ -400,9 +413,14 @@ class StemTranscriptionRunner:
         self.strict_velocity = bool(strict_velocity)
         self.force = bool(force)
         self.cleanup_stems = bool(cleanup_stems)
+        self.amp_enabled = bool(amp and is_amp_supported(self.device))
+        self.amp_dtype = resolve_amp_dtype(self.device, amp_dtype)
+        self.compile_model = bool(compile_model)
+        self.compile_velocity = bool(compile_velocity)
+        self.compile_mode = str(compile_mode)
         self._separation_bundle: tuple[Any, Any, torch.dtype] | None = None
-        self._amt_bundles: dict[str, tuple[Any, Any, Any]] = {}
-        self._velocity_bundle: tuple[Any, Any] | None = None
+        self._amt_bundles: dict[str, tuple[Any, Any, Any, Any]] = {}
+        self._velocity_bundle: tuple[Any, Any, Any] | None = None
 
     def _get_separation_bundle(self) -> tuple[Any, Any, torch.dtype]:
         if self._separation_bundle is not None:
@@ -433,7 +451,7 @@ class StemTranscriptionRunner:
         self._separation_bundle = (config, model, dtype)
         return self._separation_bundle
 
-    def _get_amt_bundle(self, model_type: str) -> tuple[Any, Any, Any]:
+    def _get_amt_bundle(self, model_type: str) -> tuple[Any, Any, Any, Any]:
         cached = self._amt_bundles.get(model_type)
         if cached is not None:
             cached[0].to(self.device)
@@ -456,10 +474,15 @@ class StemTranscriptionRunner:
             stride_ms_override=None,
             track_batch_size_override=None,
         )
-        self._amt_bundles[model_type] = (model, config, settings)
+        forward_model = maybe_compile_forward(
+            model,
+            enabled=self.compile_model,
+            mode=self.compile_mode,
+        )
+        self._amt_bundles[model_type] = (model, forward_model, config, settings)
         return self._amt_bundles[model_type]
 
-    def _get_velocity_bundle(self) -> tuple[Any, Any]:
+    def _get_velocity_bundle(self) -> tuple[Any, Any, Any]:
         if self._velocity_bundle is not None:
             self._velocity_bundle[0].to(self.device)
             self._velocity_bundle[0].eval()
@@ -469,10 +492,16 @@ class StemTranscriptionRunner:
             )
 
             LOGGER.info("Loading velocity model on %s", self.device)
-            self._velocity_bundle = load_velocity_model(
+            model, config = load_velocity_model(
                 self.velocity_checkpoint,
                 device=self.device,
             )
+            forward_model = maybe_compile_forward(
+                model,
+                enabled=self.compile_velocity,
+                mode=self.compile_mode,
+            )
+            self._velocity_bundle = (model, forward_model, config)
         return self._velocity_bundle
 
     def _separate(
@@ -546,7 +575,7 @@ class StemTranscriptionRunner:
         import infer as amt_infer
 
         model_type = resolve_stem_model_type(stem_name)
-        model, config, settings = self._get_amt_bundle(model_type)
+        model, forward_model, config, settings = self._get_amt_bundle(model_type)
         allowed_ids = amt_infer.resolve_stem_instrument_class_ids(stem_name)
         allowed_ids = amt_infer.filter_supported_instrument_class_ids(
             allowed_ids,
@@ -559,12 +588,13 @@ class StemTranscriptionRunner:
         )
         notes, _, _ = amt_infer.run_inference(
             model=model,
+            forward_model=forward_model,
             waveform=waveform.to(self.device),
             model_config=config,
             settings=settings,
             device=self.device,
-            amp_enabled=False,
-            amp_dtype=(torch.float16 if self.device.type == "cuda" else torch.float32),
+            amp_enabled=self.amp_enabled,
+            amp_dtype=self.amp_dtype,
             velocity=100,
             merge_gap_ms=None,
             merge_onset_ms=self.merge_onset_ms,
@@ -610,7 +640,7 @@ class StemTranscriptionRunner:
             predict_velocity_for_stem_midis,
         )
 
-        model, config = self._get_velocity_bundle()
+        model, forward_model, config = self._get_velocity_bundle()
         partial_midi = output_midi.with_suffix(".partial.mid")
         partial_midi.unlink(missing_ok=True)
         generated = Path(
@@ -624,7 +654,10 @@ class StemTranscriptionRunner:
                 window_seconds=8.0,
                 max_melodic_instruments=self.max_melodic_instruments,
                 disable_tqdm=True,
+                compile_velocity=self.compile_velocity,
+                compile_mode=self.compile_mode,
                 preloaded_model=model,
+                preloaded_forward=forward_model,
                 preloaded_config=config,
             )
         )
@@ -747,25 +780,24 @@ class StemTranscriptionRunner:
         return result_midi
 
     def park(self) -> None:
-        """Move cached audio models off CUDA before midi-frame inference."""
-        if self.device.type != "cuda":
+        """MIDI-frame推論の前に音声モデルをアクセラレータから退避する。"""
+        if self.device.type not in {"cuda", "mps"}:
             return
         if self._separation_bundle is not None:
             self._separation_bundle[1].to("cpu")
-        for model, _, _ in self._amt_bundles.values():
+        for model, _, _, _ in self._amt_bundles.values():
             model.to("cpu")
         if self._velocity_bundle is not None:
             self._velocity_bundle[0].to("cpu")
         gc.collect()
-        torch.cuda.empty_cache()
+        empty_device_cache(self.device)
 
     def release(self) -> None:
         self._separation_bundle = None
         self._amt_bundles.clear()
         self._velocity_bundle = None
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        empty_device_cache(self.device)
 
 
 def build_midi_frame_infer_command(
@@ -843,8 +875,20 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--recursive", action="store_true")
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--amp-dtype", choices=("fp16", "bf16"), default=None)
+    parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--compile-velocity", action="store_true")
     parser.add_argument(
-        "--device", default="cuda" if torch.cuda.is_available() else "cpu"
+        "--compile-mode",
+        choices=(
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+            "max-autotune-no-cudagraphs",
+        ),
+        default="default",
     )
     parser.add_argument(
         "--amt-checkpoint-dir",
@@ -971,6 +1015,11 @@ def run_batch(args: argparse.Namespace) -> list[CandidateResult]:
         strict_velocity=args.strict_velocity,
         force=args.force,
         cleanup_stems=args.cleanup_stems,
+        amp=args.amp,
+        amp_dtype=args.amp_dtype,
+        compile_model=args.compile,
+        compile_velocity=args.compile_velocity,
+        compile_mode=args.compile_mode,
     )
 
     repository_root = Path(__file__).resolve().parents[2]

@@ -18,6 +18,7 @@ from ..inference.instruments import (
 from ..inference.midi import build_midi
 from ..inference.types import InferenceSettings
 from ..inference.windowed import decode_notes
+from ..data.pitch_aliases import DEFAULT_DRUM_PITCH_ALIASES
 from ..modeling.checkpoints import (
     coerce_model_config,
     extract_model_config,
@@ -26,11 +27,16 @@ from ..modeling.checkpoints import (
     load_compatible_weights,
 )
 from ..modeling.model import AudioSemiCRFTransformer, SemiCRFModelConfig
+from ..runtime import (
+    is_amp_supported,
+    maybe_compile_forward,
+    resolve_amp_dtype,
+    resolve_device,
+)
 from ..taxonomy.instrument_classes import (
     INSTRUMENT_CLASSES,
     get_instrument_class_id_by_name,
 )
-
 
 HF_CHECKPOINT_BASE_URL = (
     "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main"
@@ -43,8 +49,11 @@ MODEL_CHECKPOINT_FILENAMES = {
     "guitar": "best_model_guitar.pth",
     "guitar_v1_5": "best_model_guitar_v1_5.pth",
     "vocal_harmony": "best_model_vocal_harmony.pth",
+    "vocal_harmony_v1_5": "best_model_vocal_harmony_v1_5.pth",
     "drums": "best_model_drums.pth",
+    "drums_v1_5": "best_model_drums_v1_5.pth",
     "other": "best_model_other.pth",
+    "other_v1_5": "best_model_other_v1_5.pth",
 }
 
 
@@ -168,13 +177,32 @@ def parse_args() -> argparse.Namespace:
         "--output-dir", type=Path, default=None, help="Output directory for --audio-dir"
     )
     parser.add_argument(
-        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
+        "--device",
+        type=str,
+        default="auto",
+        help="Inference device: auto, cuda, mps, or cpu",
     )
-    parser.add_argument("--amp", action="store_true", help="Enable CUDA autocast")
+    parser.add_argument("--amp", action="store_true", help="Enable accelerator autocast")
     parser.add_argument(
         "--amp-dtype",
         choices=("fp16", "bf16"),
-        default="bf16" if torch.cuda.is_bf16_supported() else "fp16",
+        default=None,
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Compile shared AMT Transformer regions with TorchInductor",
+    )
+    parser.add_argument(
+        "--compile-mode",
+        choices=(
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+            "max-autotune-no-cudagraphs",
+        ),
+        default="default",
+        help="torch.compile mode used when --compile is enabled",
     )
     parser.add_argument(
         "--window-ms",
@@ -202,6 +230,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Chunk size for Semi-CRF track decoding. Defaults to checkpoint value, or 128.",
+    )
+    parser.add_argument(
+        "--semi-crf-backend",
+        choices=("torch", "triton"),
+        default="torch",
+        help=(
+            "Dense Semi-CRF decoder backend. Triton requires CUDA and performs "
+            "a one-time JIT compilation for each frame length."
+        ),
     )
     parser.add_argument(
         "--semi-crf-sparse-decode",
@@ -267,6 +304,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--velocity", type=int, default=100)
     parser.add_argument(
+        "--collapse-crash-cymbals",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Map drum pitch 57 (Crash Cymbal 2) to the canonical pitch 49 "
+            "(Crash Cymbal 1) in exported MIDI. Enabled by default; use "
+            "--no-collapse-crash-cymbals to preserve both pitches."
+        ),
+    )
+    parser.add_argument(
         "--instrument-volume",
         action="append",
         default=[],
@@ -321,6 +368,11 @@ def parse_args() -> argparse.Namespace:
             "--semi-crf-sparse-decode requires --semi-crf-sparse-max-span-ms "
             "to avoid dense score construction"
         )
+    if args.semi_crf_sparse_decode and args.semi_crf_backend != "torch":
+        parser.error(
+            "--semi-crf-backend triton cannot be combined with "
+            "--semi-crf-sparse-decode"
+        )
     if args.instrument_pair_infer_topk < 0:
         parser.error("--instrument-pair-infer-topk must be non-negative")
     if args.instrument_pair_max_pairs <= 0:
@@ -343,12 +395,6 @@ def parse_args() -> argparse.Namespace:
     except ValueError as exc:
         parser.error(str(exc))
     return args
-
-
-def resolve_amp_dtype(device: torch.device, dtype_str: str) -> torch.dtype:
-    if dtype_str == "bf16":
-        return torch.bfloat16
-    return torch.float16
 
 
 def load_model(
@@ -427,6 +473,7 @@ def resolve_inference_settings(
         instrument_probability_mode=(
             "softmax" if training_args.get("instrument_loss_type") == "ce" else "sigmoid"
         ),
+        semi_crf_backend=str(args.semi_crf_backend),
         semi_crf_sparse_decode=bool(args.semi_crf_sparse_decode),
         semi_crf_sparse_topk_per_start=int(args.semi_crf_sparse_topk_per_start),
         semi_crf_sparse_score_threshold=args.semi_crf_sparse_score_threshold,
@@ -461,6 +508,7 @@ def process_file(
     output_midi_path: Path,
     *,
     model: AudioSemiCRFTransformer,
+    forward_model: torch.nn.Module | None = None,
     config: SemiCRFModelConfig,
     instrument_id: int | None,
     settings: InferenceSettings,
@@ -480,6 +528,7 @@ def process_file(
         amp_dtype=amp_dtype,
         settings=settings,
         velocity=int(args.velocity),
+        forward_model=forward_model,
     )
     midi, midi_stats = build_midi(
         notes,
@@ -488,6 +537,11 @@ def process_file(
         min_midi_note_ms=float(args.min_midi_note_ms),
         max_midi_melodic_instruments=int(args.max_midi_melodic_instruments),
         instrument_volumes=dict(args.instrument_volume_map),
+        drum_pitch_aliases=(
+            DEFAULT_DRUM_PITCH_ALIASES
+            if bool(getattr(args, "collapse_crash_cymbals", True))
+            else None
+        ),
         return_stats=True,
     )
     output_midi_path.parent.mkdir(parents=True, exist_ok=True)
@@ -496,6 +550,7 @@ def process_file(
         f"wrote {len(notes)} notes: {output_midi_path} "
         f"instrument={_instrument_label(instrument_id)} "
         f"window_ms={settings.window_ms} stride_ms={settings.stride_ms} "
+        f"semi_crf_backend={settings.semi_crf_backend} "
         f"windows={stats['window_count']} "
         f"decoded_windows={stats['decoded_window_count']} "
         f"skipped_silent_windows={stats['skipped_silent_window_count']} "
@@ -506,20 +561,28 @@ def process_file(
         f"midi_instruments_before_remap={midi_stats['midi_instrument_count_before_remap']} "
         f"midi_instruments_after_remap={midi_stats['midi_instrument_count_after_remap']} "
         f"remapped_instruments={midi_stats['remapped_instrument_count']} "
-        f"remapped_notes={midi_stats['remapped_note_count']}"
+        f"remapped_notes={midi_stats['remapped_note_count']} "
+        f"remapped_drum_pitch_notes={midi_stats['remapped_drum_pitch_note_count']}"
     )
 
 
 def main() -> None:
     args = parse_args()
-    device = torch.device(args.device)
+    device = resolve_device(args.device)
+    if args.semi_crf_backend == "triton" and device.type != "cuda":
+        raise ValueError("--semi-crf-backend triton requires a CUDA device")
     amp_dtype = resolve_amp_dtype(device, args.amp_dtype)
-    amp_enabled = bool(args.amp and device.type == "cuda")
+    amp_enabled = bool(args.amp and is_amp_supported(device))
     instrument_id = (
         resolve_instrument_id(args.instrument) if args.instrument is not None else None
     )
     checkpoint_path = _ensure_checkpoint(args.checkpoint, model_type=args.type)
     model, config, training_args = load_model(checkpoint_path.resolve(), device=device)
+    forward_model = maybe_compile_forward(
+        model,
+        enabled=bool(args.compile),
+        mode=str(args.compile_mode),
+    )
     settings = resolve_inference_settings(config, training_args, args)
     requested_instrument_ids = (
         (int(instrument_id),)
@@ -548,6 +611,7 @@ def main() -> None:
                 audio_path,
                 output_path,
                 model=model,
+                forward_model=forward_model,
                 config=config,
                 instrument_id=instrument_id,
                 settings=settings,
@@ -568,6 +632,7 @@ def main() -> None:
         audio_path,
         output_path,
         model=model,
+        forward_model=forward_model,
         config=config,
         instrument_id=instrument_id,
         settings=settings,

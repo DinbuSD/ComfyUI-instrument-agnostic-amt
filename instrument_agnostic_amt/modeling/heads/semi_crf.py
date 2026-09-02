@@ -49,75 +49,108 @@ def _strictly_lower_triangular_mask(T: int, device: torch.device) -> torch.Tenso
 
 
 @torch.jit.script
+def _viterbi_backward_tensors(
+    score: torch.Tensor,
+    noise_score: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Viterbi DPをデバイス上で実行し、tracebackに必要な状態を返す。"""
+    time_steps = _validate_shapes(score, noise_score)
+    track_count = int(score.shape[2])
+
+    q = score.new_zeros(time_steps, track_count)
+    pointers = torch.jit.annotate(List[torch.Tensor], [])
+    q[time_steps - 1] = score[time_steps - 1, time_steps - 1, :] * (
+        score[time_steps - 1, time_steps - 1, :] > 0
+    )
+
+    for offset in range(1, time_steps):
+        begin = time_steps - offset - 1
+
+        # 区間候補とskip候補を別々に評価し、時刻ごとの一時的なcatを作らない。
+        interval_values = q[begin + 1 :, :] + score[begin + 1 :, begin, :]
+        best_interval_value, interval_selection = interval_values.max(dim=0)
+        skip_value = q[begin + 1, :] + noise_score[begin, :]
+
+        # 旧実装ではskipが候補の先頭にあり、同点時はskipが選ばれていた。
+        use_interval = best_interval_value > skip_value
+        pointers.append(torch.where(use_interval, interval_selection, -1))
+        best_value = torch.where(use_interval, best_interval_value, skip_value)
+
+        singleton_mask = score[begin, begin, :] > 0
+        q[begin] = best_value + score[begin, begin, :] * singleton_mask
+
+    # traceback順のpointerをtrack-majorで直接積み、転置コピーを発生させない。
+    return (
+        torch.stack(pointers, dim=1),
+        torch.diagonal(score, dim1=0, dim2=1) > 0,
+    )
+
+
 def viterbiBackward(
     score: torch.Tensor,
     noiseScore: torch.Tensor,
     forcedStartPos: Optional[List[int]] = None,
+    *,
+    backend: str = "torch",
 ) -> IntervalBatch:
     """
-    Decode intervals from left to right.
+    左から右へ最良の区間列をデコードする。
 
     Args:
-        score: [T, T, B] where score[end, begin, batch] is the score for [begin, end].
-        noiseScore: [T-1, B] score for a non-event transition [t, t+1].
-        forcedStartPos: per-batch forced start position for segmented decoding.
+        score: [T, T, B]。score[end, begin, batch]は[begin, end]のスコア。
+        noiseScore: [T-1, B]。位置[t, t+1]をskipするスコア。
+        forcedStartPos: 分割デコードで使用するトラックごとの開始位置。
+        backend: dense Viterbiを実行するバックエンド。torchまたはtriton。
     """
-    T = _validate_shapes(score, noiseScore)
-    nBatch = int(score.shape[2])
+    if backend not in {"torch", "triton"}:
+        raise ValueError("backend must be one of {'torch', 'triton'}")
+    if backend == "triton":
+        if score.device.type != "cuda":
+            raise ValueError("Triton Semi-CRF decoding requires a CUDA tensor")
+        try:
+            from .semi_crf_triton import viterbi_backward_triton
+        except ModuleNotFoundError as exc:
+            if exc.name is None or not exc.name.startswith("triton"):
+                raise
+            raise RuntimeError(
+                "Triton Semi-CRF decoding requires the triton package"
+            ) from exc
+        return viterbi_backward_triton(score, noiseScore, forcedStartPos)
 
-    q = score.new_zeros(T, nBatch)
-    ptr = []
+    pointers, diag_inclusion = _viterbi_backward_tensors(score, noiseScore)
+    time_steps = int(score.shape[0])
+    track_count = int(score.shape[2])
 
-    scoreT = score.transpose(0, 1).contiguous()
-    q[T - 1] = score[T - 1, T - 1, :] * (score[T - 1, T - 1, :] > 0)
-
-    for offset in range(1, T):
-        t = T - offset - 1
-        subScore = scoreT[t, t + 1 :, :]
-
-        candidates = torch.cat(
-            [
-                q[t + 1 : t + 2, :] + noiseScore[t, :],  # skip current position
-                q[t + 1 :, :] + subScore,  # start an interval at t
-            ],
-            dim=0,
-        )
-
-        bestValue, selection = candidates.max(dim=0)
-        ptr.append(selection - 1)
-
-        singletonMask = score[t, t, :] > 0
-        q[t] = bestValue + score[t, t, :] * singletonMask
-
-    ptr = torch.stack(ptr, dim=0).cpu()
-    diagInclusion = (torch.diagonal(score, dim1=0, dim2=1) > 0).cpu()
+    # TensorのCPUスカラー参照は高コストなため、一括転送後はPython list上を辿る。
+    pointer_values = pointers.cpu().tolist()
+    diag_values = diag_inclusion.cpu().tolist()
 
     if forcedStartPos is None:
-        forcedStartPos = [0] * nBatch
+        forcedStartPos = [0] * track_count
 
     result: IntervalBatch = []
-    for batchIdx in range(nBatch):
-        pos = forcedStartPos[batchIdx]
-        batchResult: List[Interval] = []
-        curDiag = diagInclusion[batchIdx]
+    for track in range(track_count):
+        position = forcedStartPos[track]
+        track_result: List[Interval] = []
+        current_diag = diag_values[track]
 
-        while pos < T - 1:
-            selection = int(ptr[T - pos - 2][batchIdx])
+        while position < time_steps - 1:
+            selection = int(pointer_values[track][time_steps - position - 2])
 
-            if bool(curDiag[pos]):
-                batchResult.append((pos, pos))
+            if bool(current_diag[position]):
+                track_result.append((position, position))
 
             if selection < 0:
-                pos += 1
+                position += 1
             else:
-                end = selection + pos + 1
-                batchResult.append((pos, end))
-                pos = end
+                end = selection + position + 1
+                track_result.append((position, end))
+                position = end
 
-        if score[T - 1, T - 1, batchIdx] > 0:
-            batchResult.append((T - 1, T - 1))
+        if bool(current_diag[time_steps - 1]):
+            track_result.append((time_steps - 1, time_steps - 1))
 
-        result.append(batchResult)
+        result.append(track_result)
 
     return result
 
@@ -287,6 +320,14 @@ class ComputeLogZFasterGrad(torch.autograd.Function):
 computeLogZFasterGrad = ComputeLogZFasterGrad.apply
 
 
+def _validate_loss_backend(backend: str, device: torch.device) -> None:
+    """Semi-CRF loss backend名と実行deviceの組み合わせを検証する。"""
+    if backend not in {"torch", "triton"}:
+        raise ValueError("backend must be one of {'torch', 'triton'}")
+    if backend == "triton" and device.type != "cuda":
+        raise ValueError("Triton Semi-CRF loss requires a CUDA tensor")
+
+
 def evalPath(
     intervals: IntervalBatch, score: torch.Tensor, noiseScore: torch.Tensor
 ) -> torch.Tensor:
@@ -363,33 +404,69 @@ class NeuralSemiCRFInterval:
         self.noiseScore = noiseScore
 
     def decode(
-        self, forcedStartPos: Optional[List[int]] = None, forward: bool = False
+        self,
+        forcedStartPos: Optional[List[int]] = None,
+        forward: bool = False,
+        *,
+        backend: str = "torch",
     ) -> IntervalBatch:
-        """Decode the best interval sequence."""
+        """指定バックエンドで最良の区間列をデコードする。"""
         if forward:
+            if backend != "torch":
+                raise ValueError("forward Viterbi decoding only supports torch")
             return viterbi(self.score, self.noiseScore, forcedStartPos)
-        return viterbiBackward(self.score, self.noiseScore, forcedStartPos)
+        return viterbiBackward(
+            self.score,
+            self.noiseScore,
+            forcedStartPos,
+            backend=backend,
+        )
 
     def evalPath(self, intervals: IntervalBatch) -> torch.Tensor:
         """Compute the unnormalized score of a given interval path."""
         return evalPath(intervals, self.score, self.noiseScore)
 
-    def computeLogZ(self, noBackward: bool = False) -> torch.Tensor:
+    def computeLogZ(
+        self,
+        noBackward: bool = False,
+        *,
+        backend: str = "torch",
+    ) -> torch.Tensor:
         """
         Compute log Z.
 
         noBackward=True uses the plain scripted DP.
         noBackward=False uses the custom-autograd implementation with faster gradients.
         """
+        _validate_loss_backend(backend, self.score.device)
         if noBackward:
+            if backend != "torch":
+                raise ValueError("noBackward log-partition only supports torch")
             return computeLogZ(self.score, self.noiseScore)
+        if backend == "triton":
+            try:
+                from .semi_crf_loss_triton import compute_log_z_triton
+            except ModuleNotFoundError as exc:
+                if exc.name is None or not exc.name.startswith("triton"):
+                    raise
+                raise RuntimeError(
+                    "Triton Semi-CRF loss requires the triton package"
+                ) from exc
+            return compute_log_z_triton(self.score, self.noiseScore)
         return computeLogZFasterGrad(self.score, self.noiseScore)
 
     def logProb(
-        self, intervals: IntervalBatch, noBackward: bool = False
+        self,
+        intervals: IntervalBatch,
+        noBackward: bool = False,
+        *,
+        backend: str = "torch",
     ) -> torch.Tensor:
         """Compute log p(intervals)."""
-        return self.evalPath(intervals) - self.computeLogZ(noBackward=noBackward)
+        return self.evalPath(intervals) - self.computeLogZ(
+            noBackward=noBackward,
+            backend=backend,
+        )
 
 
 def _flatten_pitch_interval_batch(
@@ -1031,7 +1108,7 @@ def _build_dense_sparse_candidates(
     end_index = torch.arange(length, device=device).unsqueeze(0)
     valid_mask = end_index > begin_index
 
-    score_by_begin = score.transpose(0, 1).contiguous()
+    score_by_begin = score.transpose(0, 1)
     score_by_begin = score_by_begin.masked_fill(
         ~valid_mask.unsqueeze(-1), float("-inf")
     )
@@ -1339,8 +1416,10 @@ def compute_flat_interval_loss(
     track_batch_size: int = 128,
     false_negative_cost: float = 0.0,
     false_positive_cost: float = 0.0,
+    backend: str = "torch",
 ) -> tuple[torch.Tensor, int, int]:
     """Compute Semi-CRF NLL for an already-selected flat track set."""
+    _validate_loss_backend(backend, flat_query.device)
     if flat_query.shape != flat_key.shape:
         raise ValueError(
             "flat_query and flat_key must share the same shape, "
@@ -1432,12 +1511,12 @@ def compute_flat_interval_loss(
             )
             if interval_cost is None:
                 semi_crf = NeuralSemiCRFInterval(score, noise_score)
-                chunk_loss = -semi_crf.logProb(chunk_targets)
+                chunk_loss = -semi_crf.logProb(chunk_targets, backend=backend)
             else:
                 augmented_score = score + interval_cost
                 semi_crf = NeuralSemiCRFInterval(augmented_score, noise_score)
                 gold_score = evalPath(chunk_targets, score, noise_score)
-                chunk_loss = semi_crf.computeLogZ() - gold_score
+                chunk_loss = semi_crf.computeLogZ(backend=backend) - gold_score
             total_loss_sum = total_loss_sum + chunk_loss.sum()
             total_tracks += int(chunk_indices.numel())
             total_intervals += sum(len(track) for track in chunk_targets)
@@ -1465,8 +1544,10 @@ def compute_factorized_pair_interval_loss(
     track_batch_size: int = 128,
     false_negative_cost: float = 0.0,
     false_positive_cost: float = 0.0,
+    backend: str = "torch",
 ) -> tuple[torch.Tensor, int, int]:
     """Compute V2 Semi-CRF NLL from additive pitch/instrument projections."""
+    _validate_loss_backend(backend, pitch_query.device)
 
     batch_size, _, _, _, track_count = (
         _validate_factorized_interval_inputs(
@@ -1561,12 +1642,12 @@ def compute_factorized_pair_interval_loss(
             )
             if interval_cost is None:
                 semi_crf = NeuralSemiCRFInterval(score, noise_score)
-                chunk_loss = -semi_crf.logProb(chunk_targets)
+                chunk_loss = -semi_crf.logProb(chunk_targets, backend=backend)
             else:
                 augmented_score = score + interval_cost
                 semi_crf = NeuralSemiCRFInterval(augmented_score, noise_score)
                 gold_score = evalPath(chunk_targets, score, noise_score)
-                chunk_loss = semi_crf.computeLogZ() - gold_score
+                chunk_loss = semi_crf.computeLogZ(backend=backend) - gold_score
             total_loss_sum = total_loss_sum + chunk_loss.sum()
             total_tracks += int(chunk_indices.numel())
             total_intervals += sum(len(track) for track in chunk_targets)
@@ -1588,6 +1669,7 @@ def compute_pitch_interval_loss(
     track_batch_size: int = 128,
     false_negative_cost: float = 0.0,
     false_positive_cost: float = 0.0,
+    backend: str = "torch",
 ) -> tuple[torch.Tensor, int, int]:
     """
     Compute pitch-wise semi-CRF NLL from interval query/key features.
@@ -1603,7 +1685,9 @@ def compute_pitch_interval_loss(
             Cost added during training for active frames that are left uncovered.
         false_positive_cost:
             Cost added during training for silent frames covered by an interval.
+        backend: log-partitionを計算するtorchまたはtriton backend。
     """
+    _validate_loss_backend(backend, interval_query.device)
     if interval_query.shape != interval_key.shape:
         raise ValueError(
             "interval_query and interval_key must share the same shape, "
@@ -1704,12 +1788,12 @@ def compute_pitch_interval_loss(
             )
             if interval_cost is None:
                 semi_crf = NeuralSemiCRFInterval(score, noise_score)
-                chunk_loss = -semi_crf.logProb(chunk_targets)
+                chunk_loss = -semi_crf.logProb(chunk_targets, backend=backend)
             else:
                 augmented_score = score + interval_cost
                 semi_crf = NeuralSemiCRFInterval(augmented_score, noise_score)
                 gold_score = evalPath(chunk_targets, score, noise_score)
-                chunk_loss = semi_crf.computeLogZ() - gold_score
+                chunk_loss = semi_crf.computeLogZ(backend=backend) - gold_score
             total_loss_sum = total_loss_sum + chunk_loss.sum()
             total_tracks += int(chunk_indices.numel())
             total_intervals += sum(len(track) for track in chunk_targets)
@@ -1904,6 +1988,7 @@ def decode_pitch_intervals(
     note_bias: float = 0.0,
     track_batch_size: int = 128,
     forced_start_pos: Optional[torch.Tensor | List[int] | List[List[int]]] = None,
+    backend: str = "torch",
 ) -> PitchIntervalBatch:
     """
     Decode pitch-wise best non-overlapping intervals from interval query/key features.
@@ -2002,7 +2087,10 @@ def decode_pitch_intervals(
                 ).tolist()
             else:
                 chunk_forced_start_pos = None
-            decoded_chunk = semi_crf.decode(forcedStartPos=chunk_forced_start_pos)
+            decoded_chunk = semi_crf.decode(
+                forcedStartPos=chunk_forced_start_pos,
+                backend=backend,
+            )
             for flat_index, intervals in zip(chunk_indices.tolist(), decoded_chunk):
                 decoded_flat[int(flat_index)] = intervals
 
@@ -2030,6 +2118,7 @@ def decode_factorized_pair_intervals(
     note_bias: float = 0.0,
     track_batch_size: int = 128,
     forced_start_pos: Optional[torch.Tensor | List[int]] = None,
+    backend: str = "torch",
 ) -> IntervalBatch:
     """Decode independent selected V2 tracks from factorized projections."""
 
@@ -2120,7 +2209,10 @@ def decode_factorized_pair_intervals(
                 if flat_forced_start_pos is not None
                 else None
             )
-            decoded_chunk = semi_crf.decode(forcedStartPos=chunk_forced_start_pos)
+            decoded_chunk = semi_crf.decode(
+                forcedStartPos=chunk_forced_start_pos,
+                backend=backend,
+            )
             for flat_index, intervals in zip(chunk_indices.tolist(), decoded_chunk):
                 decoded_flat[int(flat_index)] = intervals
     return decoded_flat

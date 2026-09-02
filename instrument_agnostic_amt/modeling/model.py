@@ -179,17 +179,17 @@ class AudioSemiCRFTransformer(nn.Module):
             return torch.ones(batch_size, num_frames, dtype=torch.bool, device=device)
         if valid_audio_frames.dim() != 1:
             raise ValueError("valid_audio_frames must be a 1D tensor")
-        lengths = torch.tensor(
-            [
-                compute_model_frames(
-                    int(frame_count), self.config.n_fft, self.config.hop_length
-                )
-                for frame_count in valid_audio_frames.tolist()
-            ],
-            device=device,
-            dtype=torch.long,
+        audio_lengths = valid_audio_frames.to(device=device, dtype=torch.long)
+        hop_length = int(self.config.hop_length)
+        complete_frames = torch.div(
+            audio_lengths,
+            hop_length,
+            rounding_mode="floor",
         )
-        return torch.arange(num_frames, device=device).unsqueeze(0) < lengths.unsqueeze(1)
+        has_partial_frame = torch.remainder(audio_lengths, hop_length).ne(0)
+        lengths = complete_frames + has_partial_frame.to(dtype=torch.long)
+        frame_indices = torch.arange(num_frames, device=device).unsqueeze(0)
+        return frame_indices < lengths.unsqueeze(1)
 
     def forward(
         self,
@@ -198,11 +198,15 @@ class AudioSemiCRFTransformer(nn.Module):
         valid_audio_frames: Optional[torch.Tensor] = None,
         include_amt: bool = True,
         include_aux_outputs: bool = True,
+        include_frame_instrument_logits: bool = True,
         **_: object,
     ) -> dict[str, torch.Tensor | None]:
         if not include_amt:
             raise ValueError("this model exposes only the AMT task")
-        backbone_output = self.backbone(waveform)
+        backbone_output = self.backbone(
+            waveform,
+            include_aux_outputs=include_aux_outputs,
+        )
         pitch_features = backbone_output.pitch_query_features
         frame_valid_mask = self._build_frame_valid_mask(
             batch_size=int(waveform.shape[0]),
@@ -210,9 +214,14 @@ class AudioSemiCRFTransformer(nn.Module):
             valid_audio_frames=valid_audio_frames,
             device=waveform.device,
         )
-        outputs: dict[str, torch.Tensor | None] = self.head(
-            pitch_features, frame_valid_mask
-        )
+        if isinstance(self.head, V1SemiCRFHead):
+            outputs: dict[str, torch.Tensor | None] = self.head(
+                pitch_features,
+                frame_valid_mask,
+                include_frame_instrument_logits=include_frame_instrument_logits,
+            )
+        else:
+            outputs = self.head(pitch_features, frame_valid_mask)
         outputs.update(
             {
                 "band_features": (
@@ -238,19 +247,31 @@ class AudioSemiCRFTransformer(nn.Module):
         self,
         features: torch.Tensor,
         interval_batch: Sequence[Sequence[Sequence[tuple[int, int]]]],
+        *,
+        compute_dtype: torch.dtype | None = None,
     ) -> tuple[torch.Tensor, list[tuple[int, int, int, int, int]]]:
         if not isinstance(self.head, V1SemiCRFHead):
             raise RuntimeError("predict_interval_boundaries is a V1-head operation")
-        return self.head.predict_interval_boundaries(features, interval_batch)
+        return self.head.predict_interval_boundaries(
+            features,
+            interval_batch,
+            compute_dtype=compute_dtype,
+        )
 
     def predict_interval_instruments(
         self,
         features: torch.Tensor,
         interval_batch: Sequence[Sequence[Sequence[tuple[int, int]]]],
+        *,
+        compute_dtype: torch.dtype | None = None,
     ) -> tuple[torch.Tensor, list[tuple[int, int, int, int, int]]]:
         if not isinstance(self.head, V1SemiCRFHead):
             raise RuntimeError("predict_interval_instruments is a V1-head operation")
-        return self.head.predict_interval_instruments(features, interval_batch)
+        return self.head.predict_interval_instruments(
+            features,
+            interval_batch,
+            compute_dtype=compute_dtype,
+        )
 
     def build_selected_pair_indices(
         self,
@@ -267,6 +288,8 @@ class AudioSemiCRFTransformer(nn.Module):
         interval_features: torch.Tensor,
         selected_pairs: SelectedPairIndices,
         interval_batch: Sequence[Sequence[tuple[int, int]]],
+        *,
+        compute_dtype: torch.dtype | None = None,
     ) -> tuple[torch.Tensor, list[tuple[int, int, int, int]]]:
         if not isinstance(self.head, V2OverlapSemiCRFHead):
             raise RuntimeError("flat interval boundaries require the V2 head")
@@ -274,6 +297,7 @@ class AudioSemiCRFTransformer(nn.Module):
             interval_features,
             selected_pairs,
             interval_batch,
+            compute_dtype=compute_dtype,
         )
 
     def load_state_dict(

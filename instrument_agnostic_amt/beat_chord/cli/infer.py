@@ -34,6 +34,7 @@ from ..decoding.legacy_grid import (
 )
 from ..midi_roll import MidiFrameLoader, MidiFrameLoaderConfig
 from ..tempo_map_export import MeterSegmentSpec, export_tempo_mapped_midi
+from ...runtime import copy_tensors_to_cpu_once, resolve_device
 
 
 HF_CHECKPOINT_BASE_URL = (
@@ -79,7 +80,7 @@ def load_beat_chord_model(
     if not checkpoint_file.exists():
         raise FileNotFoundError(f"Beat/chord checkpoint not found: {checkpoint_file}")
 
-    checkpoint = torch.load(checkpoint_file, map_location=device_obj, weights_only=False)
+    checkpoint = torch.load(checkpoint_file, map_location="cpu", weights_only=False)
     model_config_dict = checkpoint["model_config"]
     model_config = MidiFrameModelConfig(**model_config_dict)
 
@@ -129,6 +130,7 @@ class BeatChordInferenceConfig:
     device: torch.device
     window_ms_override: int | None = None
     stride_ms_override: int | None = None
+    window_batch_size: int = 1
     beat_decode_mode: str = "grid"
     beat_threshold: float = 0.5
     downbeat_threshold: float = 0.5
@@ -246,6 +248,71 @@ def run_beat_chord_inference(
 
     start_seconds = 0.0
     stride_seconds = stride_ms / 1000.0
+    window_batch_size = int(config.window_batch_size)
+    if window_batch_size <= 0:
+        raise ValueError("window_batch_size must be positive")
+    pending_rolls: list[torch.Tensor] = []
+    pending_start_frames: list[int] = []
+    omit_aux_outputs = isinstance(model, MidiFrameBeatChordModel)
+
+    def flush_pending_windows() -> None:
+        if not pending_rolls:
+            return
+        roll_batch = torch.stack(pending_rolls).to(device)
+        with torch.inference_mode():
+            model_kwargs: dict[str, object] = {
+                "include_beat": True,
+                "include_chord": True,
+            }
+            if omit_aux_outputs:
+                model_kwargs["include_aux_outputs"] = False
+            outputs = model(roll_batch, **model_kwargs)
+            (
+                beat_probs,
+                downbeat_probs,
+                group_boundary_probs,
+                meter_logits_batch,
+                chord_logits_batch,
+                chord_boundary_probs,
+                bass_logits_batch,
+                key_boundary_probs,
+                key_logits_batch,
+            ) = copy_tensors_to_cpu_once(
+                (
+                    torch.sigmoid(outputs["beat_logits"]),
+                    torch.sigmoid(outputs["downbeat_logits"]),
+                    torch.sigmoid(outputs["group_boundary_logits"]),
+                    outputs["meter_logits"],
+                    outputs["root_chord_logits"],
+                    torch.sigmoid(outputs["chord_boundary_logits"]),
+                    outputs["bass_logits"],
+                    torch.sigmoid(outputs["key_boundary_logits"]),
+                    outputs["key_logits"],
+                )
+            )
+            del outputs
+
+        for batch_index, batch_start_frame in enumerate(pending_start_frames):
+            target = slice(batch_start_frame, batch_start_frame + model_frames)
+            chord_boundary_probabilities_accum[target] += chord_boundary_probs[
+                batch_index
+            ]
+            bass_logits_accum[target] += bass_logits_batch[batch_index]
+            key_boundary_probabilities_accum[target] += key_boundary_probs[
+                batch_index
+            ]
+            key_logits_accum[target] += key_logits_batch[batch_index]
+            beat_probabilities_accum[target] += beat_probs[batch_index]
+            downbeat_probabilities_accum[target] += downbeat_probs[batch_index]
+            group_boundary_probabilities_accum[target] += group_boundary_probs[
+                batch_index
+            ]
+            meter_logits_accum[target] += meter_logits_batch[batch_index]
+            chord_logits_accum[target] += chord_logits_batch[batch_index]
+            weight_accum[target] += 1.0
+
+        pending_rolls.clear()
+        pending_start_frames.clear()
 
     while start_seconds < duration_seconds:
         start_frame = int(round(start_seconds * sample_rate / hop_length))
@@ -254,46 +321,17 @@ def run_beat_chord_inference(
                 song_name="", window_start_sec=start_seconds, num_frames=model_frames
             )
         except Exception:
-            start_seconds += stride_seconds
-            continue
-
-        roll = roll.unsqueeze(0).to(device)
-
-        with torch.no_grad():
-            outputs = model(roll, include_beat=True, include_chord=True)
-
-            beat_prob = torch.sigmoid(outputs["beat_logits"]).squeeze(0).cpu()
-            downbeat_prob = torch.sigmoid(outputs["downbeat_logits"]).squeeze(0).cpu()
-            group_boundary_prob = (
-                torch.sigmoid(outputs["group_boundary_logits"]).squeeze(0).cpu()
-            )
-            meter_logits = outputs["meter_logits"].squeeze(0).cpu()
-            chord_logits = outputs["root_chord_logits"].squeeze(0).cpu()
-            chord_boundary_prob = (
-                torch.sigmoid(outputs["chord_boundary_logits"]).squeeze(0).cpu()
-            )
-            bass_logits = outputs["bass_logits"].squeeze(0).cpu()
-            key_boundary_prob = (
-                torch.sigmoid(outputs["key_boundary_logits"]).squeeze(0).cpu()
-            )
-            key_logits = outputs["key_logits"].squeeze(0).cpu()
-
-        chord_boundary_probabilities_accum[
-            start_frame : start_frame + model_frames
-        ] += chord_boundary_prob
-        bass_logits_accum[start_frame : start_frame + model_frames] += bass_logits
-        key_boundary_probabilities_accum[start_frame : start_frame + model_frames] += key_boundary_prob
-        key_logits_accum[start_frame : start_frame + model_frames] += key_logits
-        beat_probabilities_accum[start_frame : start_frame + model_frames] += beat_prob
-        downbeat_probabilities_accum[start_frame : start_frame + model_frames] += downbeat_prob
-        group_boundary_probabilities_accum[
-            start_frame : start_frame + model_frames
-        ] += group_boundary_prob
-        meter_logits_accum[start_frame : start_frame + model_frames] += meter_logits
-        chord_logits_accum[start_frame : start_frame + model_frames] += chord_logits
-        weight_accum[start_frame : start_frame + model_frames] += 1.0
+            pass
+        else:
+            pending_rolls.append(roll)
+            pending_start_frames.append(start_frame)
 
         start_seconds += stride_seconds
+        if (
+            len(pending_rolls) >= window_batch_size
+            or start_seconds >= duration_seconds
+        ):
+            flush_pending_windows()
 
     active_mask = weight_accum > 0
     beat_probabilities_accum[active_mask] /= weight_accum[active_mask]
@@ -465,10 +503,20 @@ def predict_beat_chord_for_midi(
     beat_decode_mode: str = "grid",
     window_ms_override: int | None = None,
     stride_ms_override: int | None = None,
+    window_batch_size: int = 1,
     beat_mapped_ticks_per_beat: int = 480,
     disable_tqdm: bool = False,
+    grid_jit: bool | None = None,
+    preloaded_model: torch.nn.Module | None = None,
+    preloaded_model_config: MidiFrameModelConfig | None = None,
+    preloaded_metadata: Mapping[str, object] | None = None,
 ) -> Path:
-    """指定された MIDI 入力に対して beat/chord/key を推論し、テンポマップ書き込み済み MIDI を出力する。"""
+    """指定された MIDI 入力に対して beat/chord/key を推論し、テンポマップ書き込み済み MIDI を出力する。
+
+    ``grid_jit=None`` はNumbaが利用できる環境で、Python実装と同値な拍グリッド
+    kernelを自動選択する。preloaded引数は長寿命のColabセッションでモデルを
+    再利用し、同じcheckpointを実行ごとに読み直さないために使う。
+    """
     input_midi_file = Path(input_midi_path).resolve()
     if not input_midi_file.exists():
         raise FileNotFoundError(f"Input MIDI file not found: {input_midi_file}")
@@ -478,16 +526,37 @@ def predict_beat_chord_for_midi(
     else:
         output_midi_file = Path(output_midi_path).resolve()
 
-    if device is None:
-        device_obj = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device_obj = torch.device(device)
+    device_obj = resolve_device(device)
 
-    resolved_checkpoint_path = ensure_beat_chord_checkpoint(checkpoint_path)
-    model, model_config, metadata = load_beat_chord_model(
-        resolved_checkpoint_path,
-        device=device_obj,
+    preloaded_values = (
+        preloaded_model,
+        preloaded_model_config,
+        preloaded_metadata,
     )
+    if any(value is None for value in preloaded_values) and not all(
+        value is None for value in preloaded_values
+    ):
+        raise ValueError(
+            "preloaded_model, preloaded_model_config, and preloaded_metadata "
+            "must be provided together"
+        )
+    if preloaded_model is None:
+        resolved_checkpoint_path = ensure_beat_chord_checkpoint(checkpoint_path)
+        model, model_config, metadata = load_beat_chord_model(
+            resolved_checkpoint_path,
+            device=device_obj,
+        )
+    else:
+        model = preloaded_model
+        model_config = preloaded_model_config
+        metadata = dict(preloaded_metadata)
+        model.to(device_obj)
+        model.eval()
+
+    if grid_jit is None:
+        from ..decoding.beat_grid_jit import is_jit_grid_available
+
+        grid_jit = is_jit_grid_available()
     
     # Defaults in original function
     config = BeatChordInferenceConfig(
@@ -495,6 +564,8 @@ def predict_beat_chord_for_midi(
         beat_decode_mode=beat_decode_mode,
         window_ms_override=window_ms_override,
         stride_ms_override=stride_ms_override,
+        window_batch_size=int(window_batch_size),
+        grid_jit=bool(grid_jit),
         beat_mapped_ticks_per_beat=beat_mapped_ticks_per_beat,
         disable_tqdm=disable_tqdm,
         beat_threshold=0.3,
@@ -507,7 +578,9 @@ def predict_beat_chord_for_midi(
 
     result = run_beat_chord_inference(
         midi_path=input_midi_file,
-        checkpoint=metadata["checkpoint"],
+        # run_beat_chord_inferenceは互換性のためcheckpoint引数を保持しているが、
+        # 推論本体では展開済みmetadataだけを参照する。
+        checkpoint=metadata.get("checkpoint", {}),
         model=model,
         model_config=model_config,
         metadata=metadata,
@@ -1169,6 +1242,12 @@ def main() -> None:
     parser.add_argument("--quality_json", type=Path, default=None, help="quality.json override.")
     parser.add_argument("--beat_decoder_cache_path", type=Path, default=None, help="Optional NPZ cache.")
     parser.add_argument("--window_ms", type=int, default=None, help="推論時の窓幅 (ms)。")
+    parser.add_argument(
+        "--window_batch_size",
+        type=int,
+        default=1,
+        help="一度に推論する窓数。",
+    )
     parser.add_argument("--beat_mapped_midi_path", type=Path, default=None, help="Output MIDI")
     parser.add_argument("--disable_beat_mapped_midi", action="store_true", help="Disable automatic export.")
     parser.add_argument("--beat_mapped_ticks_per_beat", type=int, default=960, help="Ticks per quarter note.")
@@ -1198,7 +1277,7 @@ def main() -> None:
     parser.add_argument("--grid_octave_jump_penalty", type=float, default=2.0)
     parser.add_argument("--grid_min_bpm", type=float, default=30.0)
     parser.add_argument("--grid_max_bpm", type=float, default=300.0)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--chord_boundary_threshold", type=float, default=0.5)
     parser.add_argument("--chord_boundary_min_distance_frames", type=int, default=5)
     parser.add_argument("--key_boundary_threshold", type=float, default=0.5)
@@ -1226,8 +1305,9 @@ def main() -> None:
     if args.grid_minimum_meter_run_quarter_notes <= 0.0: raise ValueError("--grid_minimum_meter_run_quarter_notes must be positive")
     if args.grid_min_bpm <= 0.0 or args.grid_max_bpm <= args.grid_min_bpm: raise ValueError("grid BPM range must be positive and increasing")
     if args.beat_mapped_ticks_per_beat <= 0: raise ValueError("--beat_mapped_ticks_per_beat must be positive")
+    if args.window_batch_size <= 0: raise ValueError("--window_batch_size must be positive")
 
-    device = torch.device(args.device)
+    device = resolve_device(args.device)
     print(f"使用デバイス: {device}")
 
     print(f"チェックポイントをロード中: {args.checkpoint}")
@@ -1253,6 +1333,7 @@ def main() -> None:
         device=device,
         window_ms_override=args.window_ms,
         stride_ms_override=args.stride_ms,
+        window_batch_size=args.window_batch_size,
         beat_decode_mode=args.beat_decode_mode,
         beat_threshold=args.beat_threshold,
         downbeat_threshold=args.downbeat_threshold,

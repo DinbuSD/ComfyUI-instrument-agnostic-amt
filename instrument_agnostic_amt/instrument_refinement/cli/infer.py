@@ -59,9 +59,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-json", type=Path, default=None)
     # ステム名を渡すと楽器候補が絞られる。分からない場合は省略（全クラスが候補）。
     parser.add_argument("--stem-name", type=str, default=None)
-    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--window-seconds", type=float, default=8.0)
     parser.add_argument("--stride-seconds", type=float, default=4.0)
+    parser.add_argument("--window-batch-size", type=int, default=1)
     # cluster: 音色ごとに楽器を分ける / single: ステム全体を 1 楽器とみなす。
     parser.add_argument("--mode", choices=("single", "cluster"), default="cluster")
     parser.add_argument("--cluster-distance", type=float, default=0.25)
@@ -91,6 +92,7 @@ def main() -> None:
         device=args.device,
         window_seconds=args.window_seconds,
         stride_seconds=args.stride_seconds,
+        window_batch_size=args.window_batch_size,
         mode=args.mode,
         cluster_distance=args.cluster_distance,
         min_cluster_notes=args.min_cluster_notes,

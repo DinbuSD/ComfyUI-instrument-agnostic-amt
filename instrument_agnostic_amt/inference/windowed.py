@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
+from collections.abc import Callable, Iterable
 from dataclasses import replace
-from typing import Iterable
 
 import torch
 from tqdm.auto import tqdm
@@ -18,6 +18,7 @@ from ..modeling.model import (
     AudioSemiCRFTransformer,
     SemiCRFModelConfig,
 )
+from ..runtime import is_amp_supported
 from .instruments import effective_instrument_ids
 from .types import InferenceSettings, PredictedNote
 
@@ -117,30 +118,25 @@ def _select_pair_candidates(
         start = int(instrument_id) * NUM_PITCHES
         allowed[start : start + NUM_PITCHES] = True
     finite_mask = finite_mask & allowed
-    if not bool(torch.any(finite_mask).item()):
-        return []
-
-    candidate_ids: set[int] = set()
     threshold = float(settings.instrument_pair_gate_threshold)
-    threshold_mask = finite_mask & (scores >= threshold)
-    if bool(torch.any(threshold_mask).item()):
-        candidate_ids.update(
-            int(item) for item in threshold_mask.nonzero().flatten().tolist()
-        )
+    selected_mask = finite_mask & (scores >= threshold)
 
     topk = max(0, int(settings.instrument_pair_infer_topk))
     if topk > 0:
         masked_scores = scores.masked_fill(~finite_mask, float("-inf"))
-        finite_count = int(torch.isfinite(masked_scores).sum().item())
-        if finite_count > 0:
-            top_ids = torch.topk(masked_scores, k=min(topk, finite_count)).indices
-            candidate_ids.update(int(item) for item in top_ids.tolist())
+        top_ids = torch.topk(masked_scores, k=min(topk, int(scores.numel()))).indices
+        selected_mask.scatter_(0, top_ids, True)
+        selected_mask &= finite_mask
 
-    if not candidate_ids:
-        return []
+    selected_scores = scores.masked_fill(~selected_mask, float("-inf"))
+    score_values = selected_scores.detach().cpu().tolist()
     ranked = sorted(
-        candidate_ids,
-        key=lambda pair_id: (-float(scores[int(pair_id)].item()), int(pair_id)),
+        (
+            pair_id
+            for pair_id, score in enumerate(score_values)
+            if math.isfinite(float(score))
+        ),
+        key=lambda pair_id: (-float(score_values[int(pair_id)]), int(pair_id)),
     )
     max_pairs = int(settings.instrument_pair_max_pairs)
     if max_pairs > 0:
@@ -167,11 +163,11 @@ def _rank_instrument_candidates_by_pitch(
     if len(candidate_instrument_ids) == 1:
         return [candidate_instrument_ids for _ in range(NUM_PITCHES)]
 
-    scores = pair_gate_logits.detach().float().cpu()
+    score_rows = pair_gate_logits.detach().float().cpu().tolist()
     ranked_by_pitch: list[tuple[int, ...]] = []
     for pitch_index in range(NUM_PITCHES):
         score_values = {
-            instrument_index: float(scores[instrument_index, pitch_index].item())
+            instrument_index: float(score_rows[instrument_index][pitch_index])
             for instrument_index in candidate_instrument_ids
         }
         finite_ids = [
@@ -227,15 +223,20 @@ def _decode_flat_boundary_features(
     boundary_presence = presence_logits > 0.0
     offset_dist = torch.distributions.ContinuousBernoulli(logits=offset_logits)
     offset_values = torch.clamp((offset_dist.mean - 0.005) / 0.99, 0.0, 1.0)
+    decoded_rows = torch.cat(
+        (boundary_presence.to(dtype=offset_values.dtype), offset_values),
+        dim=-1,
+    ).detach().cpu().tolist()
 
     for row_index, entry in enumerate(entries):
         track_index, _, _, _ = entry
+        row = decoded_rows[row_index]
         flags[int(track_index)].append(
             (
-                bool(boundary_presence[row_index, 0].item()),
-                bool(boundary_presence[row_index, 1].item()),
-                float(offset_values[row_index, 0].item()),
-                float(offset_values[row_index, 1].item()),
+                bool(row[0]),
+                bool(row[1]),
+                float(row[2]),
+                float(row[3]),
             )
         )
     return flags
@@ -554,6 +555,7 @@ def decode_notes(
     amp_dtype: torch.dtype,
     settings: InferenceSettings,
     velocity: int,
+    forward_model: Callable[..., dict[str, torch.Tensor | None]] | None = None,
 ) -> tuple[list[PredictedNote], dict[str, int]]:
     if config.semi_crf_version == "v1":
         from .v1_windowed import decode_v1_notes
@@ -568,6 +570,7 @@ def decode_notes(
             amp_dtype=amp_dtype,
             settings=settings,
             velocity=velocity,
+            forward_model=forward_model,
         )
     if waveform.dim() != 2:
         raise ValueError("waveform must have shape [channels, audio_frames]")
@@ -634,6 +637,7 @@ def decode_notes(
         dynamic_ncols=True,
         disable=bool(settings.disable_tqdm),
     )
+    inference_model = model if forward_model is None else forward_model
 
     for batch_starts in progress:
         window_tensors = []
@@ -679,9 +683,9 @@ def decode_notes(
         with torch.amp.autocast(
             device_type=device.type,
             dtype=amp_dtype,
-            enabled=bool(amp_enabled and device.type == "cuda"),
+            enabled=bool(amp_enabled and is_amp_supported(device)),
         ):
-            outputs = model(
+            outputs = inference_model(
                 batch_waveform,
                 valid_audio_frames=valid_audio_frames_tensor,
                 include_aux_outputs=False,
@@ -711,11 +715,14 @@ def decode_notes(
                 "Factorized V2 inference requires interval projections and pair gate logits"
             )
         valid_lengths = frame_valid_mask.to(dtype=torch.long).sum(dim=-1)
+        valid_length_values = tuple(
+            int(value) for value in valid_lengths.detach().cpu().tolist()
+        )
 
         for sample_index, (start_frame, valid_frames) in enumerate(
             zip(active_batch_starts, active_valid_audio_frames)
         ):
-            sample_valid_length = int(valid_lengths[sample_index].item())
+            sample_valid_length = valid_length_values[sample_index]
             if sample_valid_length <= 0:
                 continue
 
@@ -784,6 +791,7 @@ def decode_notes(
                     note_bias=float(settings.note_bias),
                     track_batch_size=int(settings.track_batch_size),
                     forced_start_pos=forced_start_pos,
+                    backend=settings.semi_crf_backend,
                 )
 
             decoded_interval_count += sum(len(track) for track in decoded_intervals)
@@ -792,9 +800,10 @@ def decode_notes(
             if use_boundary_head:
                 boundary_logits, boundary_entries = (
                     model.predict_flat_interval_boundaries(
-                        interval_features[sample_index : sample_index + 1].float(),
+                        interval_features[sample_index : sample_index + 1],
                         selected_pairs,
                         decoded_intervals,
+                        compute_dtype=torch.float32,
                     )
                 )
                 boundary_interval_count += len(boundary_entries)
@@ -820,7 +829,20 @@ def decode_notes(
                 valid_model_frames=sample_valid_length,
             )
 
-        del outputs, batch_waveform
+        del (
+            outputs,
+            batch_waveform,
+            interval_features,
+            pair_gate_logits,
+            pitch_interval_query,
+            pitch_interval_key,
+            pitch_interval_diag,
+            instrument_interval_query,
+            instrument_interval_key,
+            instrument_interval_diag,
+            frame_valid_mask,
+            valid_lengths,
+        )
 
     notes = note_stitcher.finalize()
     return notes, {
