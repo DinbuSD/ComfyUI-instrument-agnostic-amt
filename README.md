@@ -41,7 +41,7 @@ ComfyUI_windows_portable\python_embeded\python.exe -m pip install -r requirement
 # 3. 重启 ComfyUI
 ```
 
-模型**无需手动下载**：首次执行节点时自动从 Hugging Face 拉取（先官方，失败回退 hf-mirror）。全部模型约 960MB，缓存于 `ComfyUI/models/instrument_agnostic_amt/`。
+模型**无需手动下载**：首次执行节点时自动从 Hugging Face 拉取（先官方，失败回退 hf-mirror）。全部模型约 1GB，缓存于 `ComfyUI/models/instrument_agnostic_amt/`。
 
 网络受限时可强制指定下载端点：
 
@@ -56,7 +56,7 @@ export AMT_HF_ENDPOINT=https://hf-mirror.com # Linux/macOS
 
 - **simple-transcription.json**：简易单轨工作流（LoadAudio → 转写 → 保存）
 - **stem-separation.json**：单纯音轨分离（LoadAudio → 分离 → 6 轨存 FLAC 到 output/stems/<轨名>/）
-- **stem-separated-transcription.json**：完整分轨工作流（分离 → 6 轨转写 → 逐轨力度 → 精修 → 合并 → 节拍/和弦 → 保存）
+- **stem-separated-transcription.json**：完整分轨工作流（分离 → 6 轨转写 → guitar/bass/piano/other 精修 → 6 轨力度 → 合并 → 节拍/和弦 → 保存）
 
 **单轨转录**：
 
@@ -69,15 +69,17 @@ LoadAudio(音频) → Instrument Agnostic Amt(model=default) → Save MIDI
 ```
 LoadAudio
   → Stem Separate
-      ├─ vocals → Amt(vocal_harmony_v1_5)─┐
-      ├─ guitar → Amt(guitar_v1_5)       ─┤
-      ├─ bass   → Amt(bass_v2)           ─┼→ Merge MIDI → Beat Chord Key → Save MIDI
-      ├─ drums  → Amt(drums_v1_5)        ─┤
-      ├─ piano  → Amt(default)           ─┤
-      └─ other  → Amt(other_v1_5)        ─┘
+      ├─ vocals → Amt(vocal_harmony_v1_5) → Velocity ─┐
+      ├─ guitar → Amt(guitar_v1_5) → Refine → Velocity ─┤
+      ├─ bass   → Amt(bass_v2)     → Refine → Velocity ─┼→ Merge MIDI → Beat Chord Key → Save MIDI
+      ├─ drums  → Amt(drums_v1_5)  → Velocity ─┤
+      ├─ piano  → Amt(default)     → Refine → Velocity ─┤
+      └─ other  → Amt(other_v1_5)  → Refine → Velocity ─┘
 ```
 
-可选后处理：每轨 `Predict Velocity`（需要该轨音频）；other 轨建议接 `Refine Instrument`（分类最易乱的轨道）；`Merge MIDI` 最多 8 路输入。
+> vocals / drums 不做乐器精修（上游 `REFINEMENT_EXCLUDED_STEM_GROUPS` 官方设定，鼓类候选与角色类轨道不适合重标）；guitar / bass / piano / other 精修后接力度预测，与官方管线一致。
+
+可选后处理：每轨 `Predict Velocity`（需要该轨音频）；guitar / bass / piano / other 建议接 `Refine Instrument`（分类易乱的轨道）；`Merge MIDI` 最多 8 路输入。
 
 ## 模型清单（自动下载）
 
@@ -115,4 +117,4 @@ LoadAudio
 
 ## 开发声明
 
-本节点全程使用 DeepSeek-V4-Flash（模型）与 ZCode（前端）开发。
+本节点使用 DeepSeek 模型（DeepSeek Harness 前端）开发。

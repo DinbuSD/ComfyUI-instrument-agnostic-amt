@@ -41,7 +41,7 @@ ComfyUI_windows_portable\python_embeded\python.exe -m pip install -r requirement
 # 3. Restart ComfyUI
 ```
 
-No **manual model download** is needed: models are pulled automatically from Hugging Face on the first node execution (official endpoint first, falls back to hf-mirror). All models total ~960MB and are cached in `ComfyUI/models/instrument_agnostic_amt/`.
+No **manual model download** is needed: models are pulled automatically from Hugging Face on the first node execution (official endpoint first, falls back to hf-mirror). All models total ~1GB and are cached in `ComfyUI/models/instrument_agnostic_amt/`.
 
 If you are behind a restricted network, you can force a specific download endpoint:
 
@@ -56,7 +56,7 @@ Workflow templates ready to drag-and-drop into the ComfyUI canvas are provided i
 
 - **simple-transcription.json**: simple single-track workflow (LoadAudio → transcribe → save)
 - **stem-separation.json**: plain stem separation (LoadAudio → separate → save 6 stems as FLAC to output/stems/<stem>/)
-- **stem-separated-transcription.json**: complete per-stem workflow (separate → transcribe 6 stems → per-stem velocity → refine → merge → beat/chord/key → save)
+- **stem-separated-transcription.json**: complete per-stem workflow (separate → transcribe 6 stems → refine guitar/bass/piano/other → per-stem velocity → merge → beat/chord/key → save)
 
 **Single-track transcription**:
 
@@ -69,15 +69,17 @@ LoadAudio(audio) → Instrument Agnostic Amt(model=default) → Save MIDI
 ```
 LoadAudio
   → Stem Separate
-      ├─ vocals → Amt(vocal_harmony_v1_5)─┐
-      ├─ guitar → Amt(guitar_v1_5)       ─┤
-      ├─ bass   → Amt(bass_v2)           ─┼→ Merge MIDI → Beat Chord Key → Save MIDI
-      ├─ drums  → Amt(drums_v1_5)        ─┤
-      ├─ piano  → Amt(default)           ─┤
-      └─ other  → Amt(other_v1_5)        ─┘
+      ├─ vocals → Amt(vocal_harmony_v1_5) → Velocity ─┐
+      ├─ guitar → Amt(guitar_v1_5) → Refine → Velocity ─┤
+      ├─ bass   → Amt(bass_v2)     → Refine → Velocity ─┼→ Merge MIDI → Beat Chord Key → Save MIDI
+      ├─ drums  → Amt(drums_v1_5)  → Velocity ─┤
+      ├─ piano  → Amt(default)     → Refine → Velocity ─┤
+      └─ other  → Amt(other_v1_5)  → Refine → Velocity ─┘
 ```
 
-Optional post-processing: `Predict Velocity` per track (requires that track's audio); the "other" track is recommended to go through `Refine Instrument` (the stem most prone to misclassification); `Merge MIDI` accepts up to 8 inputs.
+> vocals / drums are not instrument-refined (upstream `REFINEMENT_EXCLUDED_STEM_GROUPS`; drum candidates and role tracks are not suitable for relabeling); guitar / bass / piano / other are refined before velocity, matching the official pipeline.
+
+Optional post-processing: `Predict Velocity` per track (requires that track's audio); guitar / bass / piano / other are recommended to go through `Refine Instrument` (the stems most prone to misclassification); `Merge MIDI` accepts up to 8 inputs.
 
 ## Model List (Auto-Downloaded)
 
@@ -115,4 +117,4 @@ The node code is MIT licensed. The vendored `instrument_agnostic_amt/` directory
 
 ## Development Note
 
-This node pack was developed entirely with DeepSeek-V4-Flash (model) and ZCode (frontend).
+This node pack was developed with DeepSeek models (DeepSeek Harness frontend).
