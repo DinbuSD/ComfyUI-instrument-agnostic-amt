@@ -951,7 +951,13 @@ class RefineInstrument:
 
 
 class BeatChordKey:
-    """Predict beat / chord / key for a MIDI and write the beat-mapped MIDI."""
+    """Predict beat / chord / key for a MIDI and write the beat-mapped MIDI.
+
+    Optional `audio` input: when the source audio is connected, the decoder
+    uses absolute-tempo evidence from the waveform (upstream 2026-09 feature)
+    to resolve half/double-tempo ambiguity. Without audio it falls back to
+    MIDI-only decoding (previous behaviour).
+    """
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -960,6 +966,9 @@ class BeatChordKey:
                 "midi": ("AMT_MIDI",),
             },
             "optional": {
+                # 源音频（可选）：连上后节拍解码用音频的绝对速度证据（上游 2026-09
+                # audio-tempo 增强），可消除倍速/半速歧义；不连退回纯 MIDI 解码
+                "audio": ("AUDIO",),
                 "checkpoint": (_list_checkpoints("best_beat_chord_key.pth"),),
                 "device": (
                     ["auto", "cuda", "cpu"],
@@ -985,7 +994,9 @@ class BeatChordKey:
     CATEGORY = "Audio/AMT"
 
     def infer(self, midi, checkpoint="", device="auto", fix_leading_tempo=True,
-              prompt=None, unique_id=None):
+              audio=None, prompt=None, unique_id=None):
+        import soundfile as sf
+
         _import_amt()
         from instrument_agnostic_amt.beat_chord.cli.infer import (
             predict_beat_chord_for_midi,
@@ -1010,6 +1021,18 @@ class BeatChordKey:
         temp_dir.mkdir(parents=True, exist_ok=True)
         midi_path = temp_dir / "beat_chord_in.mid"
         out_path = temp_dir / "beat_chord_out.mid"
+        wav_path = temp_dir / "beat_chord_audio.wav"
+
+        # 可选音频：连上后写临时 wav 传给官方 audio_path（绝对速度证据，消倍/半速歧义）
+        audio_path = None
+        if audio is not None and isinstance(audio, dict) and "waveform" in audio:
+            waveform = audio["waveform"].squeeze(0).numpy()  # [C, T]
+            if waveform.ndim == 2 and waveform.shape[0] == 1:
+                waveform = waveform[0]
+            sf.write(str(wav_path), waveform.T if waveform.ndim == 2 else waveform,
+                     int(audio["sample_rate"]))
+            audio_path = wav_path
+            print("[AMT] Beat/chord/key with audio tempo evidence")
 
         try:
             midi.write(str(midi_path))
@@ -1025,6 +1048,7 @@ class BeatChordKey:
                 checkpoint_path=checkpoint_path,
                 device=dev,
                 disable_tqdm=False,
+                audio_path=audio_path,
             )
 
             import pretty_midi
@@ -1051,7 +1075,7 @@ class BeatChordKey:
             print(f"[AMT] Beat/chord/key done: {n_tracks} tracks, {n_notes} notes")
             return (result,)
         finally:
-            for p in (midi_path, out_path):
+            for p in (midi_path, out_path, wav_path):
                 p.unlink(missing_ok=True)
 
 

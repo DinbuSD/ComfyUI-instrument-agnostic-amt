@@ -22,7 +22,7 @@
 | **Merge MIDI** | MIDI×8 → MIDI | 多轨 MIDI 合并（乐器按 program/名称归并） |
 | **Predict Velocity** | MIDI + AUDIO → MIDI | 从分离音频预测音符力度（stem_name 下拉） |
 | **Refine Instrument** | MIDI + AUDIO → MIDI | 按音色重分配乐器标签（mode: cluster/single） |
-| **Beat Chord Key** | MIDI → MIDI | 预测节拍/和弦/调性并写回；`fix_leading_tempo` 默认开，修正开头空白段导致的虚高初始 tempo |
+| **Beat Chord Key** | MIDI (+可选 AUDIO) → MIDI | 预测节拍/和弦/调性并写回；`fix_leading_tempo` 默认开，修正开头空白段导致的虚高初始 tempo；连上源音频时用音频绝对速度证据解码（上游 2026-09 增强），可消除倍速/半速歧义（分析耗时明显增加） |
 | **Save MIDI** | MIDI → 文件 | 保存到 output/midi/（SaveImage 风格命名） |
 
 ## 安装

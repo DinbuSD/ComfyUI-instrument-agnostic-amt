@@ -22,7 +22,7 @@ A ComfyUI node pack for transcribing arbitrary instrument audio (piano, guitar, 
 | **Merge MIDI** | MIDI×8 → MIDI | Merge multi-track MIDI (instruments grouped by program/name) |
 | **Predict Velocity** | MIDI + AUDIO → MIDI | Predict note velocities from the separated audio (stem_name dropdown) |
 | **Refine Instrument** | MIDI + AUDIO → MIDI | Reassign instrument labels by timbre (mode: cluster/single) |
-| **Beat Chord Key** | MIDI → MIDI | Predict beat/chord/key and write back; `fix_leading_tempo` on by default, corrects the inflated leading tempo caused by silence at the song start |
+| **Beat Chord Key** | MIDI (+ optional AUDIO) → MIDI | Predict beat/chord/key and write back; `fix_leading_tempo` on by default, corrects the inflated leading tempo caused by silence at the song start; connecting the source audio enables absolute-tempo evidence decoding (upstream 2026-09 enhancement) that resolves half/double-tempo ambiguity (note: audio analysis adds significant runtime) |
 | **Save MIDI** | MIDI → file | Save to output/midi/ (SaveImage-style naming) |
 
 ## Installation
