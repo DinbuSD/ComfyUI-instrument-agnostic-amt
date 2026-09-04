@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from instrument_agnostic_amt.taxonomy.instrument_classes import (
@@ -18,10 +19,7 @@ def _normalize_instrument_name(name: str) -> str:
     return name.strip().lower().replace("-", "_").replace(" ", "_")
 
 
-_CLASS_NAME_TO_ID = {
-    _normalize_instrument_name(class_name): idx
-    for idx, class_name in enumerate(INSTRUMENT_CLASSES)
-}
+_CLASS_NAME_TO_ID = {_normalize_instrument_name(class_name): idx for idx, class_name in enumerate(INSTRUMENT_CLASSES)}
 
 
 class MidiReadError(RuntimeError):
@@ -58,12 +56,7 @@ def _build_tempo_seconds(
     for tick, tempo in tempo_events:
         tick = int(tick)
         tempo = int(tempo)
-        current_seconds += (
-            float(tick - previous_tick)
-            * float(previous_tempo)
-            / 1_000_000.0
-            / float(ticks_per_beat)
-        )
+        current_seconds += float(tick - previous_tick) * float(previous_tempo) / 1_000_000.0 / float(ticks_per_beat)
         start_ticks.append(tick)
         start_seconds.append(current_seconds)
         tempos.append(tempo)
@@ -84,10 +77,7 @@ def _tick_to_seconds(
 
     index = max(0, bisect_right(start_ticks, int(tick)) - 1)
     return float(start_seconds[index]) + (
-        float(int(tick) - int(start_ticks[index]))
-        * float(tempos[index])
-        / 1_000_000.0
-        / float(ticks_per_beat)
+        float(int(tick) - int(start_ticks[index])) * float(tempos[index]) / 1_000_000.0 / float(ticks_per_beat)
     )
 
 
@@ -124,9 +114,7 @@ def _load_midi_events_with_mido(
             key = (channel, pitch)
             is_note_on = message.type == "note_on" and int(message.velocity) > 0
             if is_note_on:
-                active_notes.setdefault(key, []).append(
-                    (tick, int(program_by_channel.get(channel, 0)), channel == 9)
-                )
+                active_notes.setdefault(key, []).append((tick, int(program_by_channel.get(channel, 0)), channel == 9))
                 continue
 
             starts = active_notes.get(key)
@@ -171,9 +159,7 @@ def _load_midi_events_with_symusic(
     from symusic import Score
 
     score = Score(midi_path_str)
-    tempo_events = _dedupe_tempo_events(
-        [(int(tempo.time), int(tempo.mspq)) for tempo in score.tempos]
-    )
+    tempo_events = _dedupe_tempo_events([(int(tempo.time), int(tempo.mspq)) for tempo in score.tempos])
     start_ticks, start_seconds, tempos = _build_tempo_seconds(
         tempo_events=tempo_events,
         ticks_per_beat=int(score.tpq),
@@ -209,9 +195,7 @@ def _load_midi_events_with_symusic(
                 tempos=tempos,
             )
             if note_end > note_start:
-                events.append(
-                    (int(class_id), int(note.pitch), float(note_start), float(note_end))
-                )
+                events.append((int(class_id), int(note.pitch), float(note_start), float(note_end)))
     return tuple(events)
 
 
@@ -286,9 +270,7 @@ def _load_midi_events(midi_path_str: str) -> tuple[tuple[int, int, float, float]
             errors.append(f"{reader_name}: {type(exc).__name__}: {exc}")
         except Exception as exc:
             errors.append(f"{reader_name}: {type(exc).__name__}: {exc}")
-    raise MidiReadError(
-        f"Failed to read MIDI note events: {midi_path_str}; " + " | ".join(errors)
-    )
+    raise MidiReadError(f"Failed to read MIDI note events: {midi_path_str}; " + " | ".join(errors))
 
 
 class MidiFrameLoader:
@@ -300,9 +282,7 @@ class MidiFrameLoader:
             midi_path = self.config.midi_dir / f"{song_name}{suffix}"
             if midi_path.exists():
                 return midi_path
-        raise FileNotFoundError(
-            f"MIDI not found for {song_name}: {self.config.midi_dir}"
-        )
+        raise FileNotFoundError(f"MIDI not found for {song_name}: {self.config.midi_dir}")
 
     def load_window(
         self,
@@ -318,16 +298,19 @@ class MidiFrameLoader:
             raise ValueError("num_frames must be positive")
 
         midi_path = self.resolve_path(song_name)
-        roll = torch.zeros(
-            self.config.num_channels,
-            int(num_frames),
-            self.config.num_pitch_bins,
-            dtype=torch.float32,
+        # ノートごとの書き込みはtorchのslice代入だと1音につき数回のkernel launchに
+        # なる。1窓あたり数百音を曲全体で繰り返すため、numpy上で組み立ててから
+        # 最後に一度だけTensor化する。
+        roll_array = np.zeros(
+            (
+                self.config.num_channels,
+                int(num_frames),
+                self.config.num_pitch_bins,
+            ),
+            dtype=np.float32,
         )
         window_end_sec = float(window_start_sec) + (
-            float(num_frames)
-            * float(self.config.hop_length)
-            / float(self.config.sample_rate)
+            float(num_frames) * float(self.config.hop_length) / float(self.config.sample_rate)
         )
 
         class_channels = self.config.num_channels // 2
@@ -376,12 +359,10 @@ class MidiFrameLoader:
                 continue
 
             pitch_index = int(pitch - self.config.pitch_min)
-            current = roll[class_id, frame_start:frame_end, pitch_index]
             # AMT 由来 MIDI の velocity は信頼しにくいため、入力は発音有無だけにする。
-            roll[class_id, frame_start:frame_end, pitch_index] = torch.maximum(
-                current,
-                torch.ones_like(current),
-            )
+            # 書き込む値は常に 1.0 で、既存値は 0.0 か 1.0 しか取らないため、
+            # 以前の max(既存, 1.0) と代入は同じ結果になる。
+            roll_array[class_id, frame_start:frame_end, pitch_index] = 1.0
 
             # Onset の書き込み (発音開始の瞬間のフレームのみ 1.0 にする)
             if window_start_sec <= note_start < window_end_sec:
@@ -393,6 +374,6 @@ class MidiFrameLoader:
                     )
                 )
                 if 0 <= onset_frame < num_frames:
-                    roll[class_id + class_channels, onset_frame, pitch_index] = 1.0
+                    roll_array[class_id + class_channels, onset_frame, pitch_index] = 1.0
 
-        return roll
+        return torch.from_numpy(roll_array)

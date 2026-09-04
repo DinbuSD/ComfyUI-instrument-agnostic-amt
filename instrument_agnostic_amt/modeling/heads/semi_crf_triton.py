@@ -4,7 +4,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 IntervalBatch = list[list[tuple[int, int]]]
 
 
@@ -26,9 +25,7 @@ def _viterbi_backward_kernel(
 
     # 1. 最終時刻のsingleton scoreをDPの初期値にする。
     last = time_steps - 1
-    last_diag = tl.load(
-        score_by_track_begin_end + score_track_offset + last * time_steps + last
-    )
+    last_diag = tl.load(score_by_track_begin_end + score_track_offset + last * time_steps + last)
     tl.store(q + q_track_offset + last, last_diag * (last_diag > 0.0))
     tl.debug_barrier()
 
@@ -42,10 +39,7 @@ def _viterbi_backward_kernel(
             other=-float("inf"),
         )
         interval_score = tl.load(
-            score_by_track_begin_end
-            + score_track_offset
-            + begin * time_steps
-            + end_offsets,
+            score_by_track_begin_end + score_track_offset + begin * time_steps + end_offsets,
             mask=valid_end,
             other=-float("inf"),
         )
@@ -56,9 +50,7 @@ def _viterbi_backward_kernel(
             axis=0,
             tie_break_left=True,
         )
-        skip_value = tl.load(q + q_track_offset + begin + 1) + tl.load(
-            noise_by_track + noise_track_offset + begin
-        )
+        skip_value = tl.load(q + q_track_offset + begin + 1) + tl.load(noise_by_track + noise_track_offset + begin)
 
         # torch版はskipを先頭候補としていたため、同点時はskipを維持する。
         use_interval = best_interval_value > skip_value
@@ -67,12 +59,7 @@ def _viterbi_backward_kernel(
             tl.where(use_interval, best_interval_end, -1),
         )
 
-        diag = tl.load(
-            score_by_track_begin_end
-            + score_track_offset
-            + begin * time_steps
-            + begin
-        )
+        diag = tl.load(score_by_track_begin_end + score_track_offset + begin * time_steps + begin)
         best_value = tl.where(use_interval, best_interval_value, skip_value)
         tl.store(
             q + q_track_offset + begin,
@@ -89,20 +76,30 @@ def _traceback(
     forced_start_pos: list[int] | None,
 ) -> IntervalBatch:
     """GPUから一括転送した絶対終了位置を区間列へ戻す。"""
-    pointer_values = pointer_end.cpu().tolist()
-    diag_values = diag_inclusion.cpu().tolist()
     track_count = int(pointer_end.shape[0])
     time_steps = int(pointer_end.shape[1])
     if forced_start_pos is None:
         forced_start_pos = [0] * track_count
 
-    result: IntervalBatch = []
-    for track in range(track_count):
+    # 1. 区間を持ち得ないトラックをGPU上で落としてから転送する。実音源の1窓で
+    #    鳴っているpitchは全トラックの2割程度しかなく、残りは空listになるだけの
+    #    ためにT個のPython intを作ることになる。pointer_endの最終列はkernelが
+    #    書かない未初期化値なので、活性判定からは外す。
+    active_tracks = (pointer_end[:, : time_steps - 1] >= 0).any(dim=1)
+    active_tracks |= diag_inclusion.any(dim=1)
+    active_index = active_tracks.nonzero().flatten()
+    pointer_values = pointer_end.index_select(0, active_index).cpu().tolist()
+    diag_values = diag_inclusion.index_select(0, active_index).cpu().tolist()
+
+    # 2. 残したトラックだけを走査し、落としたトラックは空区間のまま返す。
+    result: IntervalBatch = [[] for _ in range(track_count)]
+    for row_index, track in enumerate(active_index.tolist()):
         position = int(forced_start_pos[track])
         track_result: list[tuple[int, int]] = []
-        current_diag = diag_values[track]
+        pointer_row = pointer_values[row_index]
+        current_diag = diag_values[row_index]
         while position < time_steps - 1:
-            end = int(pointer_values[track][position])
+            end = int(pointer_row[position])
             if bool(current_diag[position]):
                 track_result.append((position, position))
             if end < 0:
@@ -112,7 +109,7 @@ def _traceback(
                 position = end
         if bool(current_diag[time_steps - 1]):
             track_result.append((time_steps - 1, time_steps - 1))
-        result.append(track_result)
+        result[track] = track_result
     return result
 
 
@@ -165,9 +162,12 @@ def viterbi_backward_triton(
         )
 
         # 3. singletonの採否とpointerだけをCPUへ転送してtracebackする。
-        diag_inclusion = torch.diagonal(
-            score_by_track_begin_end,
-            dim1=1,
-            dim2=2,
-        ) > 0
+        diag_inclusion = (
+            torch.diagonal(
+                score_by_track_begin_end,
+                dim1=1,
+                dim2=2,
+            )
+            > 0
+        )
     return _traceback(pointer_end, diag_inclusion, forced_start_pos)
