@@ -125,12 +125,12 @@ def _import_amt() -> dict:
     if str(NODE_DIR) not in sys.path:
         sys.path.insert(0, str(NODE_DIR))
 
-    from instrument_agnostic_amt.cli.infer import (  # noqa: WPS433
+    from instrument_agnostic_amt.amt.cli.infer import (  # noqa: WPS433
         load_model,
         resolve_inference_settings,
     )
-    from instrument_agnostic_amt.inference.midi import build_midi
-    from instrument_agnostic_amt.inference.windowed import decode_notes
+    from instrument_agnostic_amt.amt.inference.midi import build_midi
+    from instrument_agnostic_amt.amt.inference.windowed import decode_notes
 
     _AMT.update(
         load_model=load_model,
@@ -486,12 +486,12 @@ class InstrumentAgnosticAmtAdvanced(_AmtTranscribeBase):
         # to bypass ProgressBar's time throttling (window batches complete
         # faster than its min interval). ---
         import tqdm.auto as _tqdm_auto
-        import instrument_agnostic_amt.inference.windowed as _windowed_mod
+        import instrument_agnostic_amt.amt.inference.windowed as _windowed_mod
 
         # v1 模型走 v1_windowed 模块（v1/v2 各自模块级绑定 tqdm，需一并 patch）
         _patched_mods = [_windowed_mod]
         try:
-            import instrument_agnostic_amt.inference.v1_windowed as _v1_mod
+            import instrument_agnostic_amt.amt.inference.v1_windowed as _v1_mod
 
             _patched_mods.append(_v1_mod)
         except Exception:

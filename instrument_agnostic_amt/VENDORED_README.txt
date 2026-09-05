@@ -16,4 +16,6 @@ the LICENSE file):
     git clone https://github.com/anime-song/instrument-agnostic-amt.git
     cp -r instrument-agnostic-amt/instrument_agnostic_amt <this directory>/
 
-The nodes only use the inference parts; training code is included but unused.
+The nodes only use the inference parts. As of upstream commit cdf0ed3
+(refactor: reorganize AMT code into packages), training code lives in the
+top-level recipes/ directory and is not vendored here.
