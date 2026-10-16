@@ -18,7 +18,7 @@
 |---|---|---|
 | **Instrument Agnostic Amt** | AUDIO → MIDI / note_count / duration | 音频转 MIDI（精简参数：model + 静音检测 + 精度 + 设备）；model 缺失自动下载 |
 | **Instrument Agnostic Amt Advanced** | AUDIO → MIDI / note_count / duration | 同上，另暴露全部高级参数（window/stride/merge/镲合并） |
-| **Stem Separate** | AUDIO → 6×AUDIO | 音轨分离；`save_outputs` 开关可保存分离产物到 output/stems/ |
+| **Stem Separate** | AUDIO → 6×AUDIO | 音轨分离；`stem_format` 选中间格式（flac 默认省磁盘 / wav 写得更快约 5s 每首）；`save_outputs` 开关可保存分离产物到 output/stems/ |
 | **Merge MIDI** | MIDI×8 → MIDI | 多轨 MIDI 合并（乐器按 program/名称归并） |
 | **Predict Velocity** | MIDI + AUDIO → MIDI | 从分离音频预测音符力度（stem_name 下拉） |
 | **Refine Instrument** | MIDI + AUDIO → MIDI | 按音色重分配乐器标签（mode: cluster/single） |
@@ -55,7 +55,7 @@ export AMT_HF_ENDPOINT=https://hf-mirror.com # Linux/macOS
 `example_workflows/` 目录内提供可直接拖入 ComfyUI 画布的工作流模板：
 
 - **simple-transcription.json**：简易单轨工作流（LoadAudio → 转写 → 保存）
-- **stem-separation.json**：单纯音轨分离（LoadAudio → 分离 → 6 轨存 FLAC 到 output/stems/<轨名>/）
+- **stem-separation.json**：单纯音轨分离（LoadAudio → 分离 → 6 轨存到 output/stems/<轨名>/，格式随 `stem_format`，默认 FLAC）
 - **stem-separated-transcription.json**：完整分轨工作流（分离 → 6 轨转写 → guitar/bass/piano/other 精修 → 6 轨力度 → 合并 → 节拍/和弦 → 保存）
 
 **单轨转录**：

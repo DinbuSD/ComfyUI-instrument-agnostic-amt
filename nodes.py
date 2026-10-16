@@ -1086,12 +1086,13 @@ def _separate_with_progress(
     model,
     device,
     send_progress,
+    output_format: str = "flac",
 ):
     """stem-splitter 官方分离循环（0.0.9 算法）＋ 本项目需要的两处 IO 替换。
 
     - 读/写用 soundfile：本机 torchcodec 原生库加载失败，官方 _separate_one_file
       的 torchaudio.load 与 _save_wav_no_warning 都会直接 RuntimeError
-    - 输出仍写 .flac（保持节点既有行为；官方写 .wav）
+    - 输出格式由 output_format 决定（默认 .flac 省磁盘；.wav 写得更快，约省 5s/首）
 
     算法部分与官方保持一致（GPU 常驻滑动累加 flush_until、末尾批次补齐成静态形状、
     hann 窗强制 float32、autocast dtype 走 resolve_amp_dtype），便于日后对齐上游。
@@ -1106,10 +1107,16 @@ def _separate_with_progress(
     import torchaudio.functional as AF
     from stem_splitter.inference import resolve_amp_dtype
 
+    file_format = str(output_format).lower().lstrip(".")
+    if file_format not in ("flac", "wav"):
+        raise ValueError(
+            f"Unsupported output_format: {output_format!r} (expected 'flac' or 'wav')"
+        )
+
     base_name = Path(input_wav_path).stem
     if config.skip_existing:
         expected = [
-            Path(output_directory) / base_name / f"{base_name}_{stem_name}.flac"
+            Path(output_directory) / base_name / f"{base_name}_{stem_name}.{file_format}"
             for stem_name in config.stem_names
         ]
         if any(p.exists() for p in expected):
@@ -1256,11 +1263,12 @@ def _separate_with_progress(
     out_root.mkdir(parents=True, exist_ok=True)
     saved: dict = {}
     for stem_index, stem_name in enumerate(config.stem_names):
-        out_path = out_root / f"{base_name}_{stem_name}.flac"
+        out_path = out_root / f"{base_name}_{stem_name}.{file_format}"
         sf.write(
             str(out_path),
             separated[stem_index, :, :total_length].T,
             int(config.target_sample_rate),
+            format=file_format.upper(),
         )
         saved[stem_name] = out_path
     return saved
@@ -1294,10 +1302,18 @@ class StemSeparate:
                     "BOOLEAN",
                     {"default": True, "tooltip": "half precision (CUDA only)"},
                 ),
-                # 临时开关：打开时把 6 轨分离 flac 保存到 output/stems/<音频名>_<时间戳>/
+                # 临时开关：打开时把 6 轨分离结果保存到 output/stems/<音频名>_<时间戳>/
                 "save_outputs": (
                     "BOOLEAN",
-                    {"default": False, "tooltip": "temporary: save stem flacs to output/stems/"},
+                    {"default": False, "tooltip": "temporary: save stem files to output/stems/"},
+                ),
+                # 分离中间文件格式：flac 省磁盘（默认）；wav 写得快，约省 5s/首。
+                # 注意：必须排在 save_outputs 之后——工作流的 widgets_values 是按位置存的，
+                # 插在中间会让已保存的工作流错位。
+                "stem_format": (
+                    ["flac", "wav"],
+                    {"default": "flac",
+                     "tooltip": "stem file format: flac (smaller, default) / wav (writes ~5s faster per song)"},
                 ),
             },
             "hidden": {
@@ -1312,8 +1328,8 @@ class StemSeparate:
     FUNCTION = "separate"
     CATEGORY = "Audio/AMT"
 
-    def separate(self, audio, device="auto", use_half=True, save_outputs=False,
-                 prompt=None, unique_id=None):
+    def separate(self, audio, device="auto", use_half=True, stem_format="flac",
+                 save_outputs=False, prompt=None, unique_id=None):
         import soundfile as sf
         import torch
 
@@ -1321,6 +1337,12 @@ class StemSeparate:
             raise RuntimeError(
                 f"[AMT] Invalid audio input: {type(audio).__name__}. "
                 "Connect LoadAudio's AUDIO output."
+            )
+
+        file_format = str(stem_format).lower().lstrip(".")
+        if file_format not in ("flac", "wav"):
+            raise ValueError(
+                f"[AMT] Unsupported stem_format: {stem_format!r} (expected 'flac' or 'wav')"
             )
 
         from stem_splitter.inference import SeparationConfig, load_mss_model
@@ -1394,7 +1416,8 @@ class StemSeparate:
 
             print(f"[AMT] Separating stems (device={dev.type}, half={config.use_half_precision})")
             paths = _separate_with_progress(
-                in_path, out_dir, config, model, dev, _send_progress
+                in_path, out_dir, config, model, dev, _send_progress,
+                output_format=file_format,
             )
 
             results = []
@@ -1413,7 +1436,7 @@ class StemSeparate:
             done = [s for s, r in zip(self.STEM_ORDER, results) if r is not None]
             print(f"[AMT] Separation done: {done} tracks")
 
-            # 临时开关：保存分离 flac 到 output/stems/<音频名>_<时间戳>/
+            # 临时开关：保存分离结果到 output/stems/<音频名>_<时间戳>/（后缀随 stem_format）
             if save_outputs:
                 import re
                 import shutil
@@ -1445,7 +1468,7 @@ class StemSeparate:
                 for stem in done:
                     p = paths.get(stem)
                     if p is not None and Path(p).exists():
-                        shutil.copy2(p, stem_dir / f"{stem}.flac")
+                        shutil.copy2(p, stem_dir / f"{stem}{Path(p).suffix}")
                 print(f"[AMT] Stems saved to {stem_dir}")
 
             return tuple(results)
