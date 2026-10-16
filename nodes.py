@@ -1087,10 +1087,16 @@ def _separate_with_progress(
     device,
     send_progress,
 ):
-    """stem-splitter 分离循环（带进度回调）。
+    """stem-splitter 官方分离循环（0.0.9 算法）＋ 本项目需要的两处 IO 替换。
 
-    与官方 _separate_one_file 同逻辑（overlap-add），每处理一个 chunk 调用
-    send_progress(done, total)。窗口张量强制 float32（float16 的 hann 窗会 NaN）。
+    - 读/写用 soundfile：本机 torchcodec 原生库加载失败，官方 _separate_one_file
+      的 torchaudio.load 与 _save_wav_no_warning 都会直接 RuntimeError
+    - 输出仍写 .flac（保持节点既有行为；官方写 .wav）
+
+    算法部分与官方保持一致（GPU 常驻滑动累加 flush_until、末尾批次补齐成静态形状、
+    hann 窗强制 float32、autocast dtype 走 resolve_amp_dtype），便于日后对齐上游。
+    进度：每批结束回调 send_progress(done, total)，与官方 on_batch 同语义（回调前
+    先 cuda.synchronize，避免进度虚报）。
     """
     import math
 
@@ -1098,16 +1104,41 @@ def _separate_with_progress(
     import soundfile as sf
     import torch
     import torchaudio.functional as AF
+    from stem_splitter.inference import resolve_amp_dtype
 
-    waveform, sr = sf.read(str(input_wav_path), dtype="float32", always_2d=True)
-    waveform = torch.from_numpy(waveform.T.copy())  # [C, T]
+    base_name = Path(input_wav_path).stem
+    if config.skip_existing:
+        expected = [
+            Path(output_directory) / base_name / f"{base_name}_{stem_name}.flac"
+            for stem_name in config.stem_names
+        ]
+        if any(p.exists() for p in expected):
+            print(f"[AMT] Skip {Path(input_wav_path).name}: output already exists")
+            return {}
+
+    data, sr = sf.read(str(input_wav_path), dtype="float32", always_2d=True)  # [T, C]
+    audio = np.ascontiguousarray(data.T)  # [C, T]
     if sr != int(config.target_sample_rate):
-        waveform = AF.resample(waveform, orig_freq=sr, new_freq=config.target_sample_rate)
-    audio = waveform.numpy().astype(np.float32, copy=False)
+        # 与官方一致：在 device 上重采样（CPU 与 GPU 路径结果有 ~1e-5 差异）
+        resampled = torch.from_numpy(audio)
+        if device.type == "cuda":
+            resampled = AF.resample(
+                resampled.to(device),
+                orig_freq=int(sr),
+                new_freq=int(config.target_sample_rate),
+            ).cpu()
+        else:
+            resampled = AF.resample(
+                resampled, orig_freq=int(sr), new_freq=int(config.target_sample_rate)
+            )
+        audio = resampled.numpy().astype(np.float32, copy=False)
 
     channels, total_length = audio.shape
     chunk_size = int(config.chunk_size)
-    hop_size = int(config.hop_size) if config.hop_size else chunk_size // 2
+    hop_size = int(config.hop_size) if config.hop_size is not None else chunk_size // 2
+    if hop_size <= 0 or hop_size > chunk_size:
+        raise ValueError("hop_size must satisfy 1 <= hop_size <= chunk_size.")
+
     if total_length <= chunk_size:
         padded_length = chunk_size
     else:
@@ -1116,65 +1147,121 @@ def _separate_with_progress(
     if padded_length > total_length:
         audio = np.pad(audio, ((0, 0), (0, padded_length - total_length)), mode="constant")
 
+    if config.window_type.lower() != "hann":
+        raise ValueError(f"Unsupported window_type: {config.window_type}")
+
     use_amp = bool(config.enable_autocast and config.use_half_precision and device.type == "cuda")
-    tensor_dtype = torch.float32  # window 必须 float32（float16 hann 窗 NaN）
-    base_window = torch.hann_window(chunk_size, periodic=False, dtype=tensor_dtype, device=device)
-    base_window_np = base_window.to(torch.float32).cpu().numpy()
+    amp_dtype = resolve_amp_dtype(config, device)
+    # 窗张量必须 float32：float16 的 hann 窗在 CUDA 会出 NaN（官方 0.0.9 同样写死）
+    if use_amp:
+        tensor_dtype = torch.float32
+    elif config.use_half_precision and device.type == "cuda":
+        tensor_dtype = torch.float16
+    else:
+        tensor_dtype = torch.float32
+    base_window = torch.hann_window(chunk_size, periodic=False, dtype=torch.float32, device=device)
 
     num_stems = len(config.stem_names)
-    accum = np.zeros((num_stems, channels, padded_length), dtype=np.float32)
-    weight_sum = np.zeros(padded_length, dtype=np.float64)
+    batch_size = int(config.batch_size)
+    separated = np.zeros((num_stems, channels, padded_length), dtype=np.float32)
+    eps = 1e-8
 
-    starts = list(range(0, padded_length - chunk_size + 1, hop_size))
-    total_chunks = len(starts)
+    # GPU 常驻滑动缓冲：只有在确定不会被后续 chunk 覆盖时才把结果搬回主机，
+    # 避免每批一次 GPU→CPU 拷贝、打断异步流水（实测比逐批回主机快约 22%）。
+    accum = None
+    weight_sum = None
+    buffer_start = 0
+
+    def flush_until(boundary: int) -> None:
+        """buffer_start..boundary 这段之后不再有 chunk 重叠，可以定稿并腾出缓冲。"""
+        nonlocal buffer_start
+        length = boundary - buffer_start
+        if accum is None or length <= 0:
+            return
+        finalized = accum[:, :, :length] / weight_sum[:length].clamp_min(eps)
+        separated[:, :, buffer_start:boundary] = finalized.cpu().numpy()
+        accum[:, :, :-length] = accum[:, :, length:].clone()
+        accum[:, :, -length:] = 0.0
+        weight_sum[:-length] = weight_sum[length:].clone()
+        weight_sum[-length:] = 0.0
+        buffer_start = boundary
 
     with torch.inference_mode():
-        for i in range(0, total_chunks, int(config.batch_size)):
-            batch_starts = starts[i : i + int(config.batch_size)]
+        starts = list(range(0, padded_length - chunk_size + 1, hop_size))
+        total_batches = math.ceil(len(starts) / batch_size)
+        if send_progress is not None:
+            send_progress(0, total_batches)
+
+        reference_batch = None
+        for batch_index, i in enumerate(range(0, len(starts), batch_size)):
+            batch_starts = starts[i : i + batch_size]
+            flush_until(batch_starts[0])
+
+            # 末尾批次补齐成与首批同形：静态形状便于 torch.compile 复用内核
+            if reference_batch is None:
+                reference_batch = len(batch_starts)
+            padded_starts = batch_starts + [batch_starts[-1]] * (
+                reference_batch - len(batch_starts)
+            )
+
             input_chunks = []
-            for start in batch_starts:
+            for start in padded_starts:
                 chunk_np = audio[:, start : start + chunk_size]
                 if chunk_np.shape[1] < chunk_size:
                     chunk_np = np.pad(
                         chunk_np, ((0, 0), (0, chunk_size - chunk_np.shape[1])), mode="constant"
                     )
                 input_chunks.append(chunk_np)
-            input_batch = torch.from_numpy(np.stack(input_chunks)).to(device=device, dtype=tensor_dtype)
+            input_batch = torch.from_numpy(np.stack(input_chunks)).to(
+                device=device, dtype=tensor_dtype
+            )
 
-            with torch.amp.autocast(
-                device_type=device.type, enabled=use_amp, dtype=torch.float16
-            ):
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp, dtype=amp_dtype):
                 output_batch = model(input_batch)
 
+            if not isinstance(output_batch, torch.Tensor) or output_batch.ndim != 4:
+                raise RuntimeError("Model output must be a 4-D tensor shaped as (B, N, C, T).")
+
+            t_out = int(output_batch.shape[-1])
+            if t_out == chunk_size:
+                window_vec = base_window
+            else:
+                window_vec = torch.hann_window(
+                    t_out, periodic=False, dtype=torch.float32, device=device
+                )
+
+            if accum is None:
+                buffer_length = (batch_size - 1) * hop_size + max(t_out, chunk_size)
+                accum = torch.zeros(
+                    (num_stems, channels, buffer_length), dtype=torch.float32, device=device
+                )
+                weight_sum = torch.zeros(buffer_length, dtype=torch.float32, device=device)
+
+            windowed_batch = output_batch.float() * window_vec.view(1, 1, 1, -1)
             for b_idx, start in enumerate(batch_starts):
-                output_chunk = output_batch[b_idx : b_idx + 1]
-                _, _, _, t_out = output_chunk.shape
-                if t_out == chunk_size:
-                    window_vec = base_window
-                    window_np = base_window_np
-                else:
-                    window_vec = torch.hann_window(
-                        t_out, periodic=False, dtype=tensor_dtype, device=device
-                    )
-                    window_np = window_vec.to(torch.float32).cpu().numpy()
-                windowed = (output_chunk * window_vec.view(1, 1, 1, -1)).squeeze(0)
-                out_np = windowed.to(torch.float32).cpu().numpy()
-                accum[:, :, start : start + t_out] += out_np
-                weight_sum[start : start + t_out] += window_np
+                offset = start - buffer_start
+                accum[:, :, offset : offset + t_out] += windowed_batch[b_idx]
+                weight_sum[offset : offset + t_out] += window_vec
 
-            send_progress(min(i + len(batch_starts), total_chunks), total_chunks)
+            del input_batch, output_batch, windowed_batch
 
-    eps = 1e-8
-    weight_sum = np.maximum(weight_sum, eps)
-    accum /= weight_sum[None, None, :]
+            if send_progress is not None:
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                send_progress(batch_index + 1, total_batches)
 
-    base_name = Path(input_wav_path).stem
+        flush_until(padded_length)
+
     out_root = Path(output_directory) / base_name
     out_root.mkdir(parents=True, exist_ok=True)
     saved: dict = {}
     for stem_index, stem_name in enumerate(config.stem_names):
         out_path = out_root / f"{base_name}_{stem_name}.flac"
-        sf.write(str(out_path), accum[stem_index, :, :total_length].T, int(config.target_sample_rate))
+        sf.write(
+            str(out_path),
+            separated[stem_index, :, :total_length].T,
+            int(config.target_sample_rate),
+        )
         saved[stem_name] = out_path
     return saved
 
