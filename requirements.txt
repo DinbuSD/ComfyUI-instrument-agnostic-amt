@@ -18,4 +18,5 @@ dlchordx
 torch_optimizer
 
 # --- stem 分离（Stem Separate 节点）---
-stem-splitter
+# 0.0.9+ 才有 fuse_band_projections 字段（节点已显式使用该字段）
+stem-splitter>=0.0.9

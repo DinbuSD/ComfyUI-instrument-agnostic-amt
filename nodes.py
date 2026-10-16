@@ -1258,6 +1258,13 @@ class StemSeparate:
             cache_dir=cache_dir,
             device_preference=dev.type,
             use_half_precision=bool(use_half and dev.type == "cuda"),
+            # stem-splitter 0.0.9 起上游改过默认值（torch_compile=True、
+            # batch_size=2、fuse_band_projections=True）。显式钉住，避免依赖
+            # 版本默认值：torch.compile 会真编译（本机 triton 已装），batch
+            # 涉及显存，两者要启用都应各自实测后再改。
+            torch_compile=False,
+            batch_size=1,
+            fuse_band_projections=True,
         )
 
         if dev.type not in StemSeparate._MODEL_CACHE:
