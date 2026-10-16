@@ -117,4 +117,4 @@ LoadAudio
 
 ## 开发声明
 
-本节点使用 DeepSeek-V4-Flash（模型）与 DeepSeek Harness（前端）开发。
+本节点使用 DeepSeek-V4.1-Flash（模型）与 DeepSeek Harness（前端）开发。
